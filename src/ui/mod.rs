@@ -120,6 +120,9 @@ pub enum Message {
     ShowAbout,
     /// Close the About dialog.
     CloseAbout,
+    /// Toggle whether hidden (dotfile) entries are shown in the grid.
+    /// Bound to the View → "Show/Hide Hidden Files" menu item and Ctrl+H.
+    ToggleHiddenFiles,
     /// No-op. Used by disabled menu entries and separators so they don't
     /// need an `Option<Message>` field.
     Noop,
@@ -222,6 +225,11 @@ pub struct App {
     /// True when the About dialog is open.
     show_about: bool,
 
+    /// Whether hidden (dotfile) entries are currently shown in the grid.
+    /// Toggled via View → "Show/Hide Hidden Files" or Ctrl+H. Defaults to
+    /// false (hidden files hidden), matching Thunar / PCManFM defaults.
+    show_hidden: bool,
+
     // --- Drag-and-drop state ---
     /// The entry path being dragged from the grid, once the drag threshold
     /// (5px movement while button held) is exceeded. None when not dragging.
@@ -261,6 +269,7 @@ impl App {
             open_menu: None,
             context_menu_target: None,
             show_about: false,
+            show_hidden: false,
             drag_source: None,
             drag_candidate_idx: None,
             drag_press_pos: None,
@@ -271,7 +280,22 @@ impl App {
     /// Navigate to `dir`. Bumps scan_id so the subscription restarts,
     /// clears the entry list immediately (so the UI feels responsive
     /// rather than showing stale entries from the old dir).
+    ///
+    /// If `dir` is relative, it's resolved against `current_dir` first —
+    /// this is defensive (the breadcrumb builder now produces absolute
+    /// paths, but a relative path typed into the pathbar edit field would
+    /// otherwise be interpreted against the process CWD, which is rarely
+    /// what the user means). We deliberately don't `canonicalize` because
+    /// that resolves symlinks, and the user may have intentionally
+    /// navigated to a symlinked path.
     fn navigate(&mut self, dir: PathBuf) {
+        let dir = if dir.is_absolute() {
+            dir
+        } else {
+            let mut resolved = self.current_dir.clone();
+            resolved.push(dir);
+            resolved
+        };
         self.current_dir = dir;
         self.scan_id = self.scan_id.wrapping_add(1);
         self.entries.clear();
@@ -350,6 +374,12 @@ impl App {
         self.show_about
     }
 
+    /// True if hidden (dotfile) entries are currently shown in the grid.
+    /// When false, the grid filters out entries whose name starts with `.`.
+    pub fn show_hidden(&self) -> bool {
+        self.show_hidden
+    }
+
     /// True if a drag-from-grid is in progress (threshold exceeded).
     #[allow(dead_code)]
     pub fn is_dragging(&self) -> bool {
@@ -380,8 +410,17 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
                 }
                 ScanEvent::Done { total, .. } => {
                     app.scanning = false;
+                    // Reflect the visible count (filtered by show_hidden)
+                    // so the status bar matches what the user sees. When
+                    // hidden files are visible, `total` is correct; when
+                    // hidden, we count only the non-hidden entries.
+                    let visible = if app.show_hidden {
+                        total
+                    } else {
+                        app.entries.iter().filter(|e| !e.hidden).count()
+                    };
                     app.status =
-                        format!("{} items • {}", total, app.current_dir.display());
+                        format!("{} items • {}", visible, app.current_dir.display());
                 }
                 ScanEvent::EntryError { path, message } => {
                     log::warn!("scan error on {}: {message}", path.display());
@@ -603,6 +642,27 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             app.show_about = false;
             Task::none()
         }
+        Message::ToggleHiddenFiles => {
+            // Flip the visibility flag. The grid view reads `show_hidden`
+            // on every render via `app.show_hidden()`, so iced re-renders
+            // automatically — no rescan needed (entries stay in memory).
+            // The status bar count is recomputed here so it matches the
+            // visible count immediately.
+            app.show_hidden = !app.show_hidden;
+            app.open_menu = None; // close the menubar dropdown after click
+            let visible = if app.show_hidden {
+                app.entries.len()
+            } else {
+                app.entries.iter().filter(|e| !e.hidden).count()
+            };
+            if app.scanning {
+                app.status = format!("scanning {}...", app.current_dir.display());
+            } else {
+                app.status =
+                    format!("{} items • {}", visible, app.current_dir.display());
+            }
+            Task::none()
+        }
         Message::Noop => Task::none(),
 
         // --- Drag-and-drop ---
@@ -718,6 +778,11 @@ fn handle_key(
     if modifiers.control() && matches!(&key, iced::keyboard::Key::Character(c) if c == "l") {
         toggle_pathbar_edit(app);
         return Task::none();
+    }
+
+    // Ctrl+H toggles hidden-files visibility (matches Thunar / PCManFM).
+    if modifiers.control() && matches!(&key, iced::keyboard::Key::Character(c) if c == "h") {
+        return update(app, Message::ToggleHiddenFiles);
     }
 
     // Escape closes things in priority order: About → context menu →

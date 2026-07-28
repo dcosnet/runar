@@ -8,6 +8,8 @@
 //!   * /var/run/media    — udisks2 auto-mount point (systemd systems)
 //!   * /opt              — optional software packages
 //!   * /usr/src          — kernel sources / build trees
+//!   * /srv              — site-specific data served by the system
+//!   * /var/www          — traditional web server document root
 //!   * $HOME             — user's home directory
 //!   * $HOME/Downloads   — downloads folder (deliberate exception to the
 //!                         "no hardcoded XDG dirs" rule — see README)
@@ -70,7 +72,7 @@ pub fn defaults() -> Vec<DefaultLocation> {
 /// Same as `defaults()` but takes an explicit home directory. Used by
 /// tests so they don't have to mutate the `HOME` env var.
 pub fn defaults_with(home: Option<PathBuf>) -> Vec<DefaultLocation> {
-    let mut out = Vec::with_capacity(6);
+    let mut out = Vec::with_capacity(8);
 
     out.push(DefaultLocation {
         label: "mnt",
@@ -93,6 +95,18 @@ pub fn defaults_with(home: Option<PathBuf>) -> Vec<DefaultLocation> {
     out.push(DefaultLocation {
         label: "src",
         path: Some(PathBuf::from("/usr/src")),
+        icon: crate::icons::Icon::Folder,
+    });
+
+    out.push(DefaultLocation {
+        label: "srv",
+        path: Some(PathBuf::from("/srv")),
+        icon: crate::icons::Icon::Folder,
+    });
+
+    out.push(DefaultLocation {
+        label: "www",
+        path: Some(PathBuf::from("/var/www")),
         icon: crate::icons::Icon::Folder,
     });
 
@@ -127,6 +141,8 @@ mod tests {
         assert!(paths.iter().any(|p| p == "/opt"));
         assert!(paths.iter().any(|p| p == "/usr/src"));
         assert!(paths.iter().any(|p| p == "/var/run/media"));
+        assert!(paths.iter().any(|p| p == "/srv"));
+        assert!(paths.iter().any(|p| p == "/var/www"));
     }
 
     #[test]
@@ -149,15 +165,17 @@ mod tests {
         assert!(d.iter().any(|x| x.label == "opt"));
         assert!(d.iter().any(|x| x.label == "src"));
         assert!(d.iter().any(|x| x.label == "removable"));
+        assert!(d.iter().any(|x| x.label == "srv"));
+        assert!(d.iter().any(|x| x.label == "www"));
     }
 
     #[test]
     fn defaults_total_count() {
-        // 4 fixed + 2 home-relative = 6 when home is provided
+        // 6 fixed + 2 home-relative = 8 when home is provided
         let d = defaults_with(Some(PathBuf::from("/home/testuser")));
-        assert_eq!(d.len(), 6);
-        // 4 fixed only when home is None
+        assert_eq!(d.len(), 8);
+        // 6 fixed only when home is None
         let d = defaults_with(None);
-        assert_eq!(d.len(), 4);
+        assert_eq!(d.len(), 6);
     }
 }

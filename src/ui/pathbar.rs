@@ -39,28 +39,7 @@ pub fn view<'a>(app: &'a super::App) -> Element<'a, Message> {
 /// by `/`. Clicking any segment navigates to that ancestor.
 fn breadcrumbs<'a>(app: &'a super::App) -> Element<'a, Message> {
     let dir = app.current_dir();
-    let mut segments: Vec<(String, PathBuf)> = Vec::new();
-    let mut acc = PathBuf::new();
-
-    // Always start with "/" as the root segment.
-    segments.push(("/".to_string(), PathBuf::from("/")));
-
-    for component in dir.components() {
-        use std::path::Component;
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                acc.push(name);
-                let label = name.to_string_lossy().into_owned();
-                segments.push((label, acc.clone()));
-            }
-            Component::ParentDir => {
-                acc.push("..");
-                segments.push(("..".into(), acc.clone()));
-            }
-            _ => {}
-        }
-    }
+    let segments = build_breadcrumb_segments(dir);
 
     let total = segments.len();
     let mut row_state = row![].spacing(2).align_y(Alignment::Center);
@@ -95,4 +74,118 @@ fn breadcrumbs<'a>(app: &'a super::App) -> Element<'a, Message> {
     }
 
     row_state.width(Length::Fill).into()
+}
+
+/// Build the (label, target_path) pairs for the breadcrumb trail of `dir`.
+///
+/// Factored out of `breadcrumbs` so it can be unit-tested without
+/// constructing a full `App`. The first segment is always the root `/`
+/// with target `/`; subsequent segments are one per `Normal` or
+/// `ParentDir` component of `dir`.
+///
+/// All emitted target paths are ABSOLUTE. This is the fix for the
+/// historical bug where clicking a non-root breadcrumb (e.g. "really"
+/// in /folder/really/deep) navigated to a relative path that failed
+/// to scan. See `build_breadcrumb_segments_produces_absolute_paths`
+/// in the tests below.
+fn build_breadcrumb_segments(dir: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let mut segments: Vec<(String, PathBuf)> = Vec::new();
+
+    // Always start with "/" as the root segment.
+    segments.push(("/".to_string(), PathBuf::from("/")));
+
+    // Accumulator for ancestor paths. MUST start as an absolute path
+    // (PathBuf::from("/")) so each `push(name)` produces an absolute
+    // path. Starting with an empty `PathBuf::new()` was the historical
+    // bug — it accumulated *relative* paths like "folder/really", which
+    // then resolved against the process's CWD instead of the filesystem
+    // root when scanned.
+    let mut acc = PathBuf::from("/");
+
+    for component in dir.components() {
+        use std::path::Component;
+        match component {
+            // RootDir is already represented by the initial "/" segment
+            // and the leading "/" in `acc`. Skip so we don't double it.
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                acc.push(name);
+                let label = name.to_string_lossy().into_owned();
+                segments.push((label, acc.clone()));
+            }
+            Component::ParentDir => {
+                acc.push("..");
+                segments.push(("..".into(), acc.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    segments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// Regression test for the breadcrumb bug: clicking a parent segment
+    /// (e.g. "really" in /folder/really/deep) must produce an ABSOLUTE
+    /// path so `navigate()` can scan it. Previously the accumulator
+    /// started as `PathBuf::new()` and produced relative paths like
+    /// "folder/really", which then resolved against the process CWD
+    /// and failed to load.
+    #[test]
+    fn build_breadcrumb_segments_produces_absolute_paths() {
+        let dir = Path::new("/folder/really/deep");
+        let segs = build_breadcrumb_segments(dir);
+
+        // Expected: [("/", "/"), ("folder", "/folder"),
+        //            ("really", "/folder/really"),
+        //            ("deep", "/folder/really/deep")]
+        assert_eq!(segs.len(), 4);
+
+        assert_eq!(segs[0].0, "/");
+        assert_eq!(segs[0].1, PathBuf::from("/"));
+
+        assert_eq!(segs[1].0, "folder");
+        assert_eq!(segs[1].1, PathBuf::from("/folder"));
+        assert!(segs[1].1.is_absolute(), "must be absolute: {}", segs[1].1.display());
+
+        assert_eq!(segs[2].0, "really");
+        assert_eq!(segs[2].1, PathBuf::from("/folder/really"));
+        assert!(segs[2].1.is_absolute(), "must be absolute: {}", segs[2].1.display());
+
+        assert_eq!(segs[3].0, "deep");
+        assert_eq!(segs[3].1, PathBuf::from("/folder/really/deep"));
+        assert!(segs[3].1.is_absolute(), "must be absolute: {}", segs[3].1.display());
+    }
+
+    /// Root path produces a single-segment breadcrumb.
+    #[test]
+    fn build_breadcrumb_segments_root_only() {
+        let segs = build_breadcrumb_segments(Path::new("/"));
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].0, "/");
+        assert_eq!(segs[0].1, PathBuf::from("/"));
+    }
+
+    /// Single-level path: two segments (root + one).
+    #[test]
+    fn build_breadcrumb_segments_single_level() {
+        let segs = build_breadcrumb_segments(Path::new("/home"));
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].0, "/");
+        assert_eq!(segs[1].0, "home");
+        assert_eq!(segs[1].1, PathBuf::from("/home"));
+    }
+
+    /// The last segment's path must equal the input dir, so clicking the
+    /// "current" breadcrumb re-scans the same dir (no-op navigate).
+    #[test]
+    fn build_breadcrumb_segments_last_matches_input() {
+        let dir = Path::new("/a/b/c/d");
+        let segs = build_breadcrumb_segments(dir);
+        assert_eq!(segs.last().unwrap().1, PathBuf::from("/a/b/c/d"));
+    }
 }

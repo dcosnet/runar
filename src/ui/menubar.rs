@@ -293,21 +293,37 @@ fn menu_items_for(kind: MenuKind, app: &super::App) -> Vec<MenuItem> {
                 Message::NotImplemented("Preferences"),
             ),
         ],
-        MenuKind::View => vec![
-            MenuItem::entry_with_shortcut(
-                "Reload",
-                "Ctrl+R",
-                Message::Reload,
-            ),
-            MenuItem::separator(),
-            MenuItem::entry("Show Hidden Files", Message::NotImplemented("Show Hidden")),
-            MenuItem::entry("Sort by Name", Message::NotImplemented("Sort by Name")),
-            MenuItem::entry("Sort by Size", Message::NotImplemented("Sort by Size")),
-            MenuItem::entry("Sort by Modified", Message::NotImplemented("Sort by Modified")),
-            MenuItem::separator(),
-            MenuItem::entry("Icon View", Message::NotImplemented("Icon View")),
-            MenuItem::entry("Detailed List", Message::NotImplemented("Detailed List")),
-        ],
+        MenuKind::View => {
+            // Dynamic label: shows "Hide Hidden Files" when they're
+            // currently visible (so clicking hides them), and "Show
+            // Hidden Files" when they're hidden (so clicking shows them).
+            // This makes the toggle direction obvious from the label
+            // alone, matching Thunar / PCManFM behavior.
+            let hidden_label = if app.show_hidden() {
+                "Hide Hidden Files"
+            } else {
+                "Show Hidden Files"
+            };
+            vec![
+                MenuItem::entry_with_shortcut(
+                    "Reload",
+                    "Ctrl+R",
+                    Message::Reload,
+                ),
+                MenuItem::separator(),
+                MenuItem::entry_with_shortcut(
+                    hidden_label,
+                    "Ctrl+H",
+                    Message::ToggleHiddenFiles,
+                ),
+                MenuItem::entry("Sort by Name", Message::NotImplemented("Sort by Name")),
+                MenuItem::entry("Sort by Size", Message::NotImplemented("Sort by Size")),
+                MenuItem::entry("Sort by Modified", Message::NotImplemented("Sort by Modified")),
+                MenuItem::separator(),
+                MenuItem::entry("Icon View", Message::NotImplemented("Icon View")),
+                MenuItem::entry("Detailed List", Message::NotImplemented("Detailed List")),
+            ]
+        }
         MenuKind::Go => {
             let mut items = vec![
                 MenuItem::entry_with_shortcut(

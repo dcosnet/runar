@@ -73,9 +73,34 @@ pub fn view<'a>(app: &'a super::App) -> Element<'a, Message> {
                 .width(Length::Fill),
         );
     } else {
+        // Filter hidden (dotfile) entries when `show_hidden` is false.
+        // We iterate the full entries slice with `enumerate()` so the
+        // row index passed to `EntryClicked(i)` still refers to the
+        // original `entries` vec — selection / activation indexing stays
+        // correct regardless of the visibility filter.
+        let show_hidden = app.show_hidden();
+        let mut visible_count = 0usize;
         for (i, entry) in entries.iter().enumerate() {
+            if !show_hidden && entry.hidden {
+                continue;
+            }
+            visible_count += 1;
             let is_selected = app.selected() == Some(i);
             list = list.push(entry_row(i, entry, is_selected));
+        }
+        // Edge case: the directory has entries but they're all hidden and
+        // the user has hidden-files hidden. Show "(empty)" rather than a
+        // blank grid so the user knows the dir isn't unreadable.
+        if visible_count == 0 {
+            list = list.push(
+                container(
+                    text("(empty)")
+                        .size(12)
+                        .color(Color::from_rgb(0.5, 0.5, 0.55)),
+                )
+                .padding([20, 12])
+                .width(Length::Fill),
+            );
         }
     }
 

@@ -27,10 +27,10 @@ pub fn view(_app: &super::App) -> Element<'static, Message> {
             .color(Color::from_rgb(0.85, 0.85, 0.88)),
         Space::new(0, 16),
         text("Author").size(11).color(Color::from_rgb(0.55, 0.55, 0.6)),
-        text("Jeremy Anderson <jeremy@dcos.net>")
+        text("Jeremy Anderson <info@dcos.net>")
             .size(13)
             .color(Color::from_rgb(0.92, 0.92, 0.93)),
-        text("https://dcos.net/runar")
+        text("https://git.dcos.net/dcosnet/runar")
             .size(12)
             .color(Color::from_rgb(0.5, 0.7, 0.95)),
         Space::new(0, 16),

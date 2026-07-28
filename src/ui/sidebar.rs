@@ -4,8 +4,8 @@
 //!                    pseudo-FSes filtered out by src/mounts.rs).
 //!
 //!   2. LOCATIONS   — hardcoded default shortcuts: /mnt, /var/run/media,
-//!                    /opt, /usr/src, $HOME, $HOME/Downloads. Always
-//!                    present; not user-removable. Defined in
+//!                    /opt, /usr/src, /srv, /var/www, $HOME, $HOME/Downloads.
+//!                    Always present; not user-removable. Defined in
 //!                    src/config/defaults.rs.
 //!
 //!   3. BOOKMARKS   — purely user-added paths. Seeded empty on first run.
