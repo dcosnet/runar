@@ -1,0 +1,52 @@
+[package]
+name = "runar"
+version = "0.1.0"
+edition = "2021"
+description = "Hybrid Thunar/PCManFM + ROX-Filer file manager built with iced. Pure-Rust, static binary."
+authors = ["Jeremy Anderson <jeremy@dcos.net>"]
+license = "GPL-2.0-only"
+repository = "https://dcos.net/runar"
+homepage = "https://dcos.net/runar"
+readme = "README.md"
+keywords = ["file-manager", "iced", "gtk-alternative", "linux", "appdir"]
+categories = ["filesystem", "gui"]
+
+[dependencies]
+# UI Shell — pure Rust, no system lib deps, true static binary
+iced = { version = "0.13", features = ["tokio", "svg", "advanced"] }
+
+# Async runtime
+tokio = { version = "1.38", features = ["fs", "rt-multi-thread", "sync", "process", "macros", "io-util"] }
+notify = "6.1"
+
+# MIME
+mime_guess = "2.0"
+
+# Config (TOML)
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Fast utility
+rayon = "1.10"
+walkdir = "2.5"
+
+# Launch fallback (xdg-open equivalent, pure Rust)
+open = "5.3"
+
+# Logging (minimal)
+log = "0.4"
+env_logger = "0.11"
+
+[[bin]]
+name = "runar"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
