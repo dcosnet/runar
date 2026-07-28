@@ -1,12 +1,14 @@
 # runar
 
-**A hybrid Thunar/PCManFM + ROX-Filer file manager, built in Rust with iced.**
+**A file manager, built in Rust with iced.**
 
 [![license: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
 [![language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![toolkit: iced 0.13](https://img.shields.io/badge/toolkit-iced%200.13-blue.svg)](https://github.com/iced-rs/iced)
 [![tests: 21 passing](https://img.shields.io/badge/tests-83%20passing-brightgreen.svg)](#testing)
 <!-- TODO: CI badge, crates.io badge once published -->
+
+![runar-ss](./runar-ss.png)
 
 runar is a keyboard-first, statically-linkable Linux file manager written from scratch in pure Rust. It borrows its visual language from the dual-pane, breadcrumb-driven design of Thunar and PCManFM, while adopting ROX-Filer's AppDir paradigm and instantaneous, daemon-free MIME action hooks. The result is a single self-contained binary with no system library dependencies and no requirement for a desktop environment to be running. It targets power users who want a fast, predictable, scriptable file manager that respects the filesystem as the source of truth. The sidebar intentionally drops the conventional pile of hardcoded XDG user directories (Music, Pictures, Videos, Public, Templates) in favor of filesystem mounts, a small fixed set of power-user locations, and user-defined bookmarks — giving you a clean slate rather than a vendor-curated set of folders.
 
@@ -280,13 +282,13 @@ No code was copied from any of the above projects. runar is a clean-room impleme
 
 ### Author
 
-**Jeremy Anderson** <jeremy@dcos.net> — https://dcos.net/runar
+**Jeremy Anderson** <info@dcos.net> — https://git.dcos.net/dcosnet/runar
 
 ---
 
 ## Contributing
 
-Patches welcome at https://dcos.net/runar (see repository for issue tracker and merge request workflow).
+Patches welcome at  https://git.dcos.net/dcosnet/runar (see repository for issue tracker and merge request workflow).
 
 Building from source requires Rust 1.70+ (stable). No system dependencies beyond a working Linux installation with /proc mounted.
 
