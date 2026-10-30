@@ -20,7 +20,7 @@
 //! When the launcher resolves an action, it walks `commands` (or the
 //! single-element list `[command]`) and runs the first command whose
 //! leading binary is found on `$PATH`. If none are installed, the
-//! launcher falls through to the built-in MIME table or `xdg-open`.
+//! launcher falls through to the built-in MIME table (`src/mime.rs`).
 //!
 //! ## Pattern forms
 //!
@@ -107,13 +107,15 @@ impl Action {
     }
 
     /// True if this action's pattern matches `path` (with optional MIME).
-    pub fn matches(&self, path: &Path, mime: Option<&mime_guess::Mime>) -> bool {
+    /// `mime` is the essence string (e.g. `"image/png"`) from the
+    /// centralized resolver; a `; charset=…` suffix is tolerated.
+    pub fn matches(&self, path: &Path, mime: Option<&str>) -> bool {
         let p = &self.pattern;
 
         // MIME patterns contain a slash.
         if p.contains('/') {
             if let Some(m) = mime {
-                let essence = m.essence_str();
+                let essence = m.split(';').next().unwrap_or(m).trim();
                 if p == essence {
                     return true;
                 }
@@ -170,12 +172,13 @@ mod tests {
     #[test]
     fn mime_glob() {
         let a = Action::single("image/*", "feh {}");
-        let png_mime: mime_guess::Mime = "image/png".parse().unwrap();
-        let jpg_mime: mime_guess::Mime = "image/jpeg".parse().unwrap();
-        let txt_mime: mime_guess::Mime = "text/plain".parse().unwrap();
-        assert!(a.matches(Path::new("x.png"), Some(&png_mime)));
-        assert!(a.matches(Path::new("x.jpg"), Some(&jpg_mime)));
-        assert!(!a.matches(Path::new("x.txt"), Some(&txt_mime)));
+        assert!(a.matches(Path::new("x.png"), Some("image/png")));
+        assert!(a.matches(Path::new("x.jpg"), Some("image/jpeg")));
+        assert!(!a.matches(Path::new("x.txt"), Some("text/plain")));
+        // A charset suffix on the resolved MIME must not break matching.
+        assert!(a.matches(Path::new("x.png"), Some("image/png; charset=utf-8")));
+        // MIME patterns never match when MIME resolution came up empty.
+        assert!(!a.matches(Path::new("x.png"), None));
     }
 
     #[test]

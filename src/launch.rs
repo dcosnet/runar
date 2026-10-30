@@ -11,13 +11,19 @@
 //!                     Supports a fallback chain: `commands = [...]`. The
 //!                     first command whose binary is on `$PATH` wins.
 //!                  b. Built-in default MIME table (`src/mime.rs`). The
-//!                     default command strings use shell-level fallback
-//!                     chains (e.g. `${EDITOR:-vi}`, the scitano→scite→
-//!                     geany→nano loop) so they work on any system.
-//!                  c. `open::that` (xdg-open on Linux) — final fallback.
+//!                     default commands use shell-level fallback chains
+//!                     (env var first, then lightweight binaries), so
+//!                     they work on any system.
+//!                  c. Direct execution — if the file itself carries an
+//!                     executable bit, run it (ROX-Filer convention).
 //!
 //!   3. Directory / Symlink → handled by the UI layer (navigation). This
 //!                module is invoked only for "open" actions.
+//!
+//! There is no xdg-open fallback by design: runar is self-contained and
+//! defers to no system MIME database. Files with no matching action, no
+//! table entry, and no executable bit report "no handler" honestly —
+//! the fix is a line in `actions.toml`, not a desktop database.
 //!
 //! All launches are detached: the child process is spawned and not
 //! waited on. Errors are returned synchronously only if `spawn()` itself
@@ -26,6 +32,7 @@
 
 use crate::config::Config;
 use crate::vfs::EntryKind;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -36,8 +43,9 @@ pub enum LaunchResult {
     /// Successfully spawned. Carries a human-readable description for the
     /// status bar (e.g. "launched vim /tmp/notes.txt").
     Spawned(String),
-    /// Nothing matched and the dispatcher declined to spawn (e.g. no
-    /// action and `open::that` not applicable). UI shows "no handler".
+    /// Nothing matched and the dispatcher declined to spawn (no action,
+    /// no built-in table entry, and no executable bit). UI shows
+    /// "no handler".
     NoHandler,
     /// Spawn failed. The user should see this.
     Failed(String),
@@ -47,7 +55,14 @@ pub enum LaunchResult {
 /// overrides before falling back to system defaults.
 pub async fn launch(path: &Path, kind: &EntryKind, config: &Config) -> LaunchResult {
     match kind {
-        EntryKind::AppDir { launcher } => spawn_direct(launcher, &[]).await,
+        EntryKind::AppDir { launcher } => {
+            // ROX convention: AppRun executes with the AppDir itself as
+            // the working directory — many AppRun scripts resolve their
+            // bundled resources relative to it, and would break with
+            // runar's inherited CWD.
+            let appdir = launcher.parent().map(|p| p.to_path_buf());
+            spawn_direct(launcher, &[], appdir.as_deref()).await
+        }
         EntryKind::File => launch_file(path, config).await,
         // Symlinks are resolved by the UI before calling launch().
         // Directory and Symlink are no-ops here.
@@ -56,8 +71,8 @@ pub async fn launch(path: &Path, kind: &EntryKind, config: &Config) -> LaunchRes
 }
 
 /// File-launch step-down: try user overrides, then built-in MIME table,
-/// then `xdg-open`. Each step either returns a `LaunchResult` or falls
-/// through to the next.
+/// then direct execution if the file is executable. Each step either
+/// returns a `LaunchResult` or falls through to the next.
 async fn launch_file(path: &Path, config: &Config) -> LaunchResult {
     // 1. User overrides from actions.toml (highest priority).
     if let Some(result) = try_user_action(path, config).await {
@@ -67,8 +82,8 @@ async fn launch_file(path: &Path, config: &Config) -> LaunchResult {
     if let Some(result) = try_builtin_default(path).await {
         return result;
     }
-    // 3. xdg-open fallback.
-    try_xdg_open(path)
+    // 3. Direct execution fallback (no xdg by design).
+    try_run_directly(path).await
 }
 
 /// Step 1: user-defined `actions.toml` overrides. Returns `None` if no
@@ -91,11 +106,19 @@ async fn try_builtin_default(path: &Path) -> Option<LaunchResult> {
     Some(run_shell(&cmd).await)
 }
 
-/// Step 3: `xdg-open` final fallback.
-fn try_xdg_open(path: &Path) -> LaunchResult {
-    match open::that(path) {
-        Ok(()) => LaunchResult::Spawned(format!("opened {}", path.display())),
-        Err(e) => LaunchResult::Failed(format!("open: {e}")),
+/// Step 3: xdg-free final fallback. If the file itself carries an
+/// executable bit, run it — the ROX-Filer convention: a double-clicked
+/// script or binary executes, exactly like ROX/Filer treats executables.
+/// The kernel's `#!` handling covers scripts. Anything else has no
+/// handler: without an xdg database there is nothing left to ask, so the
+/// honest answer is "no handler" and the fix is a line in `actions.toml`.
+async fn try_run_directly(path: &Path) -> LaunchResult {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) => {
+            spawn_direct(path, &[], None).await
+        }
+        Ok(_) => LaunchResult::NoHandler,
+        Err(e) => LaunchResult::Failed(format!("stat {}: {e}", path.display())),
     }
 }
 
@@ -211,14 +234,18 @@ fn is_executable(path: &std::path::Path) -> bool {
 }
 
 /// Spawn an executable directly (no shell). Used for AppDir launchers.
-async fn spawn_direct(exe: &Path, args: &[&str]) -> LaunchResult {
-    match Command::new(exe)
-        .args(args)
+/// `cwd` sets the child's working directory (the AppDir itself for
+/// AppRun-style launches).
+async fn spawn_direct(exe: &Path, args: &[&str], cwd: Option<&Path>) -> LaunchResult {
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    match cmd.spawn() {
         Ok(_) => LaunchResult::Spawned(format!("launched {}", exe.display())),
         Err(e) => LaunchResult::Failed(format!("spawn {}: {e}", exe.display())),
     }
@@ -228,17 +255,38 @@ async fn spawn_direct(exe: &Path, args: &[&str]) -> LaunchResult {
 /// overrides and built-in default actions. The user has full shell
 /// syntax available, including `${EDITOR:-vi}` env-var expansion.
 async fn run_shell(cmd: &str) -> LaunchResult {
-    match Command::new("sh")
+    run_shell_in(cmd, None).await
+}
+
+/// `run_shell`, with an optional working directory for the child. Used
+/// by the terminal launcher so the shell inside the new terminal window
+/// starts in the directory the user asked for.
+async fn run_shell_in(cmd: &str, cwd: Option<&Path>) -> LaunchResult {
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
+        .stderr(Stdio::inherit());
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    match command.spawn() {
         Ok(_) => LaunchResult::Spawned(format!("ran: {cmd}")),
         Err(e) => LaunchResult::Failed(format!("sh -c: {e}")),
     }
+}
+
+/// Launch a terminal emulator rooted at `dir`. Resolves the emulator via
+/// the same chain machinery as the file associations: `$TERMINAL` env
+/// var first, then the built-in terminal chain (`src/mime.rs`:
+/// rs-mrxvt → mrxvt → urxvt → ghostty → alacritty → tabby → guake).
+/// The chain runs with the child's working directory set to `dir`, so
+/// the terminal's shell starts there without per-terminal
+/// `--working-directory` flag guessing.
+pub async fn launch_terminal(dir: &Path, _config: &Config) -> LaunchResult {
+    run_shell_in(crate::mime::TERMINAL_CHAIN, Some(dir)).await
 }
 
 /// Quote a path for safe inclusion in a shell command. Single-quote,
@@ -340,5 +388,95 @@ mod tests {
     async fn binary_on_path_handles_absolute_path() {
         assert!(binary_on_path("/bin/sh").await);
         assert!(!binary_on_path("/nonexistent/path/to/binary").await);
+    }
+
+    /// The xdg-free final fallback: an executable file runs directly,
+    /// exactly as ROX-Filer would.
+    #[tokio::test]
+    async fn executable_file_runs_directly() {
+        let tmp = std::env::temp_dir().join(format!(
+            "runar-launch-exec-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let script = tmp.join("runme.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let result = try_run_directly(&script).await;
+        assert!(
+            matches!(result, LaunchResult::Spawned(_)),
+            "executable should spawn directly, got: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A plain data file with no handler anywhere reports NoHandler —
+    /// there is no xdg-open to defer to, by design.
+    #[tokio::test]
+    async fn plain_data_file_without_handler_reports_no_handler() {
+        let tmp = std::env::temp_dir().join(format!(
+            "runar-launch-none-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let data = tmp.join("data.xyzzy");
+        std::fs::write(&data, b"not an executable").unwrap();
+
+        let result = try_run_directly(&data).await;
+        assert!(matches!(result, LaunchResult::NoHandler), "got: {result:?}");
+
+        // A directory is not executable-as-file either (is_file gate).
+        let result = try_run_directly(&tmp).await;
+        assert!(matches!(result, LaunchResult::NoHandler), "got: {result:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The terminal launcher runs its chain with the child's working
+    /// directory set to the requested folder. A nonexistent directory
+    /// must fail the spawn. The success path is exercised through
+    /// `run_shell_in` with a stub command rather than the real
+    /// TERMINAL_CHAIN — on a machine where a chained terminal exists,
+    /// spawning it for real would leave a live GUI process holding the
+    /// test runner's inherited stdio pipes open, and `cargo test` would
+    /// hang after printing its results.
+    #[tokio::test]
+    async fn terminal_launch_respects_cwd() {
+        let tmp = std::env::temp_dir().join(format!(
+            "runar-launch-term-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Success path: cwd wiring spawns cleanly with a stub command
+        // that exits immediately.
+        let result = run_shell_in("exit 0", Some(&tmp)).await;
+        assert!(matches!(result, LaunchResult::Spawned(_)), "got: {result:?}");
+
+        // A nonexistent directory must fail the spawn before any
+        // process starts — true for both run_shell_in and
+        // launch_terminal.
+        let bogus = tmp.join("does-not-exist");
+        let result = run_shell_in("exit 0", Some(&bogus)).await;
+        assert!(matches!(result, LaunchResult::Failed(_)), "got: {result:?}");
+        let config = Config::default();
+        let result = launch_terminal(&bogus, &config).await;
+        assert!(matches!(result, LaunchResult::Failed(_)), "got: {result:?}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

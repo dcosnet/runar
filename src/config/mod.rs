@@ -7,7 +7,7 @@
 //!                         directories (~/Downloads, ~/Documents, etc.)").
 //!
 //!   * `actions.toml`    — file-extension / MIME-type → shell command overrides.
-//!                         Checked before `xdg-open`/`open::that` fallback.
+//!                         Checked before the built-in MIME table.
 //!
 //! Both files are created empty on first run. The engine is fail-soft: if
 //! a file is missing or malformed, the corresponding config is treated as
@@ -96,11 +96,11 @@ impl Config {
     }
 
     /// Find the first action whose pattern matches the given path (by
-    /// extension or MIME type). The launch dispatcher consults this before
-    /// falling back to `xdg-open`.
+    /// extension or MIME type). The launch dispatcher consults this
+    /// before falling back to the built-in MIME table.
     pub fn find_action_for(&self, path: &Path) -> Option<&Action> {
-        let mime = mime_guess::from_path(path).first();
-        self.actions.iter().find(|a| a.matches(path, mime.as_ref()))
+        let mime = crate::mime::resolve_mime_type(path);
+        self.actions.iter().find(|a| a.matches(path, mime.as_deref()))
     }
 
     /// Add a bookmark (deduped). Caller is responsible for `save()`.

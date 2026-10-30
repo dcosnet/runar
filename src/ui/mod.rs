@@ -49,9 +49,26 @@ pub use menubar::MenuKind;
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Streamed from `scan_directory` (Phase 1, wrapped in a subscription).
-    ScanEvent(ScanEvent),
+    /// Tagged with the directory being scanned so `update()` can drop
+    /// events that were already in flight when the user navigated away —
+    /// without this guard, stale events from the previous directory would
+    /// be appended to the new directory's entry list.
+    ScanEvent {
+        dir: PathBuf,
+        event: ScanEvent,
+    },
     /// Streamed from `watch_directory` (Phase 1, wrapped in a subscription).
-    WatchEvent(WatchEvent),
+    /// Tagged with the watched directory for the same reason as `ScanEvent`.
+    WatchEvent {
+        dir: PathBuf,
+        event: WatchEvent,
+    },
+    /// A single entry has been (re)stat'd off the UI thread — upsert it
+    /// into the grid (replace in place if the path is already listed,
+    /// otherwise insert at its sorted position). Emitted for inotify
+    /// Created/Modified/Renamed events so the grid stays live without
+    /// rescanning the whole directory.
+    UpsertEntry(FileEntry),
     /// Periodic mount poll tick.
     PollMounts,
     #[allow(dead_code)]
@@ -107,11 +124,16 @@ pub enum Message {
     /// User clicked a menubar button (File / Edit / View / Go / Bookmarks / Help).
     /// If the same menu is already open, it closes (toggle behavior).
     MenuToggled(MenuKind),
-    /// Close any open menu (menubar dropdown or context menu). Triggered
+    /// Close any open menu (menubar strip or context menu). Triggered
     /// by clicking elsewhere, pressing Escape, or after a menu action fires.
     CloseMenus,
     /// User right-clicked a grid row at the given index.
     EntryRightClicked(usize),
+    /// "Open in Terminal" from a context menu: spawn the user's terminal
+    /// emulator (via the terminal association chain) with its working
+    /// directory set to `dir` — the right-clicked directory/AppDir, or
+    /// the current directory for files.
+    OpenInTerminal(PathBuf),
     /// User selected a menu item whose action isn't implemented yet.
     /// The string is the action label, shown in the status bar so the
     /// user knows their click registered.
@@ -149,8 +171,15 @@ pub enum Message {
     /// Cursor entered the empty area below the last bookmark (drop here
     /// to append to the end of the list).
     DragEnteredBookmarkAppendZone,
-    /// Cursor left the bookmark area entirely.
-    DragExitedBookmarks,
+    /// Cursor left the bookmark row at the given index. Carries the index
+    /// so update() only clears the hover state if the cursor is still
+    /// hovering THAT row — mouse_area's on_exit of the previous widget can
+    /// arrive after on_enter of the next one, and an unconditional clear
+    /// would erase the newly-entered row's hover highlight.
+    DragExitedBookmark(usize),
+    /// Cursor left the append zone below the last bookmark. Clears the
+    /// hover state only if it still points at the append slot.
+    DragExitedBookmarkAppendZone,
 }
 
 /// Cloneable wrapper around `launch::LaunchResult` so it can travel
@@ -403,10 +432,17 @@ impl App {
 
 pub fn update(app: &mut App, msg: Message) -> Task<Message> {
     match msg {
-        Message::ScanEvent(event) => {
+        Message::ScanEvent { dir, event } => {
+            // Drop events from a scan that was in flight when the user
+            // navigated away: the old subscription's stream is dropped,
+            // but messages it had already queued still arrive. Appending
+            // them here would mix two directories into one listing.
+            if dir != app.current_dir {
+                return Task::none();
+            }
             match event {
                 ScanEvent::Entry(entry) => {
-                    app.entries.push(entry);
+                    upsert_entry_sorted(&mut app.entries, entry, &mut app.selected);
                 }
                 ScanEvent::Done { total, .. } => {
                     app.scanning = false;
@@ -435,8 +471,18 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             Task::none()
         }
 
-        Message::WatchEvent(event) => {
-            handle_watch_event(app, event);
+        Message::WatchEvent { dir, event } => {
+            // Same staleness guard as ScanEvent: the watcher subscription
+            // is recreated on navigation, but events already queued from
+            // the old directory must not touch the new directory's list.
+            if dir == app.current_dir {
+                return handle_watch_event(app, event);
+            }
+            Task::none()
+        }
+
+        Message::UpsertEntry(entry) => {
+            upsert_entry_sorted(&mut app.entries, entry, &mut app.selected);
             Task::none()
         }
 
@@ -454,6 +500,11 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
         }
 
         Message::PathBarToggleEdit => {
+            // Close any open menu — the Go → Edit Path menu item emits
+            // this, and the strip would otherwise sit directly above the
+            // edit field.
+            app.open_menu = None;
+            app.context_menu_target = None;
             app.pathbar_editing = !app.pathbar_editing;
             if app.pathbar_editing {
                 app.pathbar_input = app.current_dir.display().to_string();
@@ -465,12 +516,22 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             Task::none()
         }
         Message::PathBarSubmit => {
-            let target = PathBuf::from(&app.pathbar_input);
             app.pathbar_editing = false;
+            // Trim stray whitespace (easy to pick up when pasting a path)
+            // and expand a leading `~/` — `PathBuf` does neither, so a
+            // literal `~/Downloads` would otherwise be reported as
+            // "not a directory".
+            let raw = app.pathbar_input.trim().to_string();
+            if raw.is_empty() {
+                return Task::none();
+            }
+            let target = PathBuf::from(expand_tilde(&raw));
             if target.is_dir() {
                 app.navigate(target);
-            } else {
+            } else if target.exists() {
                 app.status = format!("not a directory: {}", target.display());
+            } else {
+                app.status = format!("no such directory: {}", target.display());
             }
             Task::none()
         }
@@ -494,6 +555,10 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             Task::none()
         }
         Message::AddBookmarkFor(p) => {
+            // Menu-initiated (Bookmarks → Add Current Directory, Ctrl+D):
+            // close the menu like any completed menu action.
+            app.open_menu = None;
+            app.context_menu_target = None;
             if app.config.add_bookmark(p.clone()) {
                 let cfg = app.config.clone();
                 return Task::perform(
@@ -504,6 +569,8 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             Task::none()
         }
         Message::RemoveBookmark(p) => {
+            app.open_menu = None;
+            app.context_menu_target = None;
             if app.config.remove_bookmark(&p) {
                 let cfg = app.config.clone();
                 return Task::perform(
@@ -521,6 +588,12 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             Task::none()
         }
         Message::EntryClicked(i) => {
+            // A click anywhere outside an open menu closes it — iced has
+            // no native click-outside detection, so the grid row's press
+            // doubles as the "clicked elsewhere" signal.
+            app.open_menu = None;
+            app.context_menu_target = None;
+
             // Record this row as a drag candidate. If the user holds the
             // button and moves (detected via GridRowMouseMoved), this
             // entry's path becomes the drag source.
@@ -563,12 +636,21 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             Task::none()
         }
         Message::EntryActivated(i, shift) => {
+            // Closes any open menu — the File → Open and context-menu
+            // "Open" entries emit this variant, and a menu action closing
+            // its menu is standard behavior.
+            app.open_menu = None;
+            app.context_menu_target = None;
             if let Some(entry) = app.entries.get(i).cloned() {
                 return activate_entry(app, entry, shift);
             }
             Task::none()
         }
         Message::Reload => {
+            // Close the View menu this was triggered from (or any other
+            // open menu / context menu).
+            app.open_menu = None;
+            app.context_menu_target = None;
             app.scan_id = app.scan_id.wrapping_add(1);
             app.entries.clear();
             app.selected = None;
@@ -605,7 +687,7 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
                 app.open_menu = None;
             } else {
                 app.open_menu = Some(kind);
-                // Close context menu when opening a menubar dropdown.
+                // Close context menu when opening a menubar strip.
                 app.context_menu_target = None;
             }
             Task::none()
@@ -625,6 +707,20 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
                 app.open_menu = None;
             }
             Task::none()
+        }
+        Message::OpenInTerminal(dir) => {
+            // Menu action completed — close the menu that launched it.
+            app.open_menu = None;
+            app.context_menu_target = None;
+            let config = app.config.clone();
+            Task::perform(
+                async move {
+                    LaunchOutcome::from(
+                        crate::launch::launch_terminal(&dir, &config).await,
+                    )
+                },
+                Message::LaunchDone,
+            )
         }
         Message::NotImplemented(what) => {
             app.open_menu = None;
@@ -649,7 +745,7 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             // The status bar count is recomputed here so it matches the
             // visible count immediately.
             app.show_hidden = !app.show_hidden;
-            app.open_menu = None; // close the menubar dropdown after click
+            app.open_menu = None; // close the menubar strip after click
             let visible = if app.show_hidden {
                 app.entries.len()
             } else {
@@ -713,8 +809,21 @@ pub fn update(app: &mut App, msg: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::DragExitedBookmarks => {
-            if app.drag_source.is_some() {
+        Message::DragExitedBookmark(idx) => {
+            // Guarded clear: on_exit of the row the cursor left may be
+            // delivered after on_enter of the row it moved to (both derive
+            // from the same mouse-move event). Only clear the hover if it
+            // still refers to the row that reported the exit, so we never
+            // erase the newly-entered drop target.
+            if app.drag_source.is_some() && app.drag_hover_bookmark == Some(idx) {
+                app.drag_hover_bookmark = None;
+            }
+            Task::none()
+        }
+        Message::DragExitedBookmarkAppendZone => {
+            if app.drag_source.is_some()
+                && app.drag_hover_bookmark == Some(app.bookmarks().len())
+            {
                 app.drag_hover_bookmark = None;
             }
             Task::none()
@@ -785,8 +894,20 @@ fn handle_key(
         return update(app, Message::ToggleHiddenFiles);
     }
 
+    // Ctrl+R reloads the current directory (advertised in the View menu).
+    if modifiers.control() && matches!(&key, iced::keyboard::Key::Character(c) if c == "r") {
+        return update(app, Message::Reload);
+    }
+
+    // Ctrl+D bookmarks the current directory (advertised in the Bookmarks
+    // menu; matches the browser "bookmark this" convention).
+    if modifiers.control() && matches!(&key, iced::keyboard::Key::Character(c) if c == "d") {
+        let here = app.current_dir.clone();
+        return update(app, Message::AddBookmarkFor(here));
+    }
+
     // Escape closes things in priority order: About → context menu →
-    // menubar dropdown → pathbar edit mode. Each guard returns early.
+    // menubar strip → pathbar edit mode. Each guard returns early.
     if matches!(key.as_ref(), iced::keyboard::Key::Named(Named::Escape)) {
         if app.show_about {
             return update(app, Message::CloseAbout);
@@ -817,6 +938,11 @@ fn handle_key(
     }
 
     if matches!(key.as_ref(), iced::keyboard::Key::Named(Named::ArrowUp)) {
+        // Alt+Up goes up one directory (advertised in the Go menu);
+        // plain ArrowUp moves the selection.
+        if modifiers.alt() {
+            return update(app, Message::GoUp);
+        }
         move_selection(app, -1);
         return Task::none();
     }
@@ -870,25 +996,35 @@ fn toggle_pathbar_edit(app: &mut App) {
 }
 
 /// Move the grid selection by `delta` rows (negative = up, positive =
-/// down). Clamps to [0, len-1]. If nothing is selected, starts at row 0
-/// (for down) or the last row (for up).
+/// down) over the *visible* entries. When hidden files are filtered out,
+/// dotfile entries are skipped rather than selected — selecting an
+/// invisible row would make the highlight disappear and Enter would
+/// activate something the user can't see. If nothing is selected, down
+/// starts at the first visible row and up at the last.
 fn move_selection(app: &mut App, delta: i32) {
-    if app.entries.is_empty() {
+    let visible: Vec<usize> = (0..app.entries.len())
+        .filter(|&i| app.show_hidden || !app.entries[i].hidden)
+        .collect();
+    if visible.is_empty() {
         return;
     }
-    let total = app.entries.len() as i32;
-    let cur = app.selected.map(|i| i as i32).unwrap_or_else(|| {
-        // No current selection: J/ArrowDown starts at 0, K/ArrowUp starts at last.
-        if delta > 0 { 0 } else { total - 1 }
-    });
-    let next = (cur + delta).clamp(0, total - 1);
-    app.selected = Some(next as usize);
+    let cur_pos = app
+        .selected
+        .and_then(|i| visible.iter().position(|&v| v == i));
+    let new_pos = match cur_pos {
+        Some(p) => (p as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize,
+        None if delta > 0 => 0,
+        None => visible.len() - 1,
+    };
+    app.selected = Some(visible[new_pos]);
 }
 
 /// Double-click / Enter on an entry. Branches on kind:
 ///   * Directory     → navigate into it
 ///   * AppDir        → spawn launcher (unless Shift is held, then navigate)
-///   * File          → launch via actions.toml or xdg-open fallback
+///   * File          → launch via actions.toml, the built-in MIME table,
+///                     or direct execution if the file is executable
+///                     (no xdg by design)
 ///   * Symlink       → resolve, then re-dispatch
 fn activate_entry(app: &mut App, entry: FileEntry, shift: bool) -> Task<Message> {
     match entry.kind {
@@ -958,57 +1094,162 @@ fn activate_entry(app: &mut App, entry: FileEntry, shift: bool) -> Task<Message>
     }
 }
 
-/// Apply a `WatchEvent` to the entry list. We do a linear scan because
-/// directory entry counts in normal use are modest (hundreds, not
-/// millions); for the 10k+ pathological case a HashMap by path would
-/// be faster — left as a future optimization.
-fn handle_watch_event(app: &mut App, event: WatchEvent) {
+/// Apply a `WatchEvent` to the entry list incrementally.
+///
+/// Each event touches exactly one entry: created/modified/renamed-to
+/// entries are re-stat'd on a background task (`build_file_entry`) and
+/// upserted via `Message::UpsertEntry`; removed/renamed-from entries are
+/// dropped in place. The earlier design triggered a full rescan on every
+/// Created event, which had two problems: the rescan appended to the
+/// existing list (duplicating every entry), and busy directories (a
+/// browser writing downloads, /tmp churn) caused continuous
+/// rescan-plus-watcher-restart storms.
+///
+/// We do a linear scan to find entries because directory entry counts in
+/// normal use are modest (hundreds, not millions).
+fn handle_watch_event(app: &mut App, event: WatchEvent) -> Task<Message> {
+    // The watcher is non-recursive, so all event paths should live
+    // directly inside the watched directory. Checking the parent guards
+    // against upserting a path from elsewhere (e.g. a rename whose
+    // destination is in another directory — that's a "moved away", not a
+    // new entry for this listing).
+    let dir = app.current_dir.clone();
+    let in_dir = |p: &Path| p.parent() == Some(dir.as_path());
+
     match event {
         WatchEvent::Created(path) => {
-            // For simplicity, trigger a reload — re-listing the whole dir
-            // is correct in all cases (file replaced, attributes changed,
-            // etc.). A future optimization would stat the new entry and
-            // append it without a full rescan.
-            app.scan_id = app.scan_id.wrapping_add(1);
-            app.scanning = true;
-            app.status = format!("rescanning: {} created", path.display());
+            if in_dir(&path) {
+                app.status = format!("+ {} created", path.display());
+                return refresh_entry(path);
+            }
+            Task::none()
         }
         WatchEvent::Removed(path) => {
-            app.entries.retain(|e| e.path != path);
-            if let Some(sel) = app.selected {
-                if sel >= app.entries.len() {
-                    app.selected = if app.entries.is_empty() {
-                        None
-                    } else {
-                        Some(app.entries.len() - 1)
-                    };
-                }
+            if in_dir(&path)
+                && remove_entry_by_path(&mut app.entries, &path, &mut app.selected)
+            {
+                app.status = format!("- {} removed", path.display());
             }
-            app.status = format!("- {} removed", path.display());
+            Task::none()
         }
         WatchEvent::Modified(path) => {
-            // Touch the entry's display by reloading its metadata.
-            // For now, just update the status bar.
-            if app.entries.iter().any(|e| e.path == path) {
+            // Re-stat so size/modified columns reflect the new contents.
+            // Only for entries we already list — Modified events for
+            // unlisted paths shouldn't conjure entries out of nowhere.
+            if in_dir(&path) && app.entries.iter().any(|e| e.path == path) {
                 app.status = format!("~ {} modified", path.display());
+                return refresh_entry(path);
             }
+            Task::none()
         }
         WatchEvent::Renamed { from, to } => {
-            if let Some(entry) = app.entries.iter_mut().find(|e| e.path == from) {
-                entry.path = to.clone();
-                entry.name = to
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                entry.hidden = entry.name.starts_with('.');
+            if in_dir(&from) {
+                remove_entry_by_path(&mut app.entries, &from, &mut app.selected);
             }
-            app.status = format!("{} → {}", from.display(), to.display());
+            if in_dir(&to) {
+                app.status = format!("{} → {}", from.display(), to.display());
+                return refresh_entry(to);
+            }
+            Task::none()
         }
         WatchEvent::WatchError(msg) => {
             app.status = format!("watch error: {msg}");
+            Task::none()
         }
     }
+}
+
+/// Stat `path` on a background task and emit `UpsertEntry` with the
+/// fresh metadata. A stat failure (file vanished between the event and
+/// the stat) is silently dropped — the next event or an explicit reload
+/// reconciles the view.
+fn refresh_entry(path: PathBuf) -> Task<Message> {
+    Task::perform(
+        async move { crate::vfs::build_file_entry(&path).await.ok() },
+        |entry| entry.map_or(Message::Noop, Message::UpsertEntry),
+    )
+}
+
+/// Sort key implementing the default grid ordering: directories and
+/// AppDirs first, then everything else; each group ordered by
+/// case-insensitive file name. (`FileEntry.name` is the file name, not
+/// the full path, so this sorts within one directory listing.)
+fn entry_sort_key(e: &FileEntry) -> (bool, String) {
+    let is_file = !matches!(e.kind, EntryKind::Directory | EntryKind::AppDir { .. });
+    (is_file, e.name.to_lowercase())
+}
+
+/// Insert `entry` into `entries`, or replace the entry with the same
+/// path in place. Insertion keeps the list sorted by `entry_sort_key`.
+/// The selection index is shifted so the highlighted row keeps pointing
+/// at the same entry.
+///
+/// The replace-if-exists path also makes upserts idempotent, which
+/// matters because a file created mid-scan can arrive twice: once via
+/// inotify (Created) and once via the scan stream.
+fn upsert_entry_sorted(
+    entries: &mut Vec<FileEntry>,
+    entry: FileEntry,
+    selected: &mut Option<usize>,
+) {
+    if let Some(i) = entries.iter().position(|e| e.path == entry.path) {
+        entries[i] = entry;
+        return;
+    }
+    let key = entry_sort_key(&entry);
+    let pos = entries.partition_point(|e| entry_sort_key(e) < key);
+    entries.insert(pos, entry);
+    if let Some(sel) = *selected {
+        if sel >= pos {
+            *selected = Some(sel + 1);
+        }
+    }
+}
+
+/// Remove the entry at `path`. The selection index is adjusted so it
+/// keeps pointing at the same row (or is clamped/dropped if that exact
+/// row is the one that went away). Returns true if an entry was removed.
+fn remove_entry_by_path(
+    entries: &mut Vec<FileEntry>,
+    path: &Path,
+    selected: &mut Option<usize>,
+) -> bool {
+    let Some(i) = entries.iter().position(|e| e.path == path) else {
+        return false;
+    };
+    entries.remove(i);
+    match *selected {
+        Some(sel) if sel == i => {
+            *selected = if entries.is_empty() {
+                None
+            } else {
+                Some(sel.min(entries.len() - 1))
+            };
+        }
+        Some(sel) if sel > i => *selected = Some(sel - 1),
+        _ => {}
+    }
+    true
+}
+
+/// Expand a leading `~` or `~/…` in pathbar input to `$HOME`. The
+/// `~user` form is left untouched — resolving other users' homes would
+/// require parsing /etc/passwd, which isn't worth it for a pathbar
+/// convenience. Returns the input unchanged when `$HOME` is unset.
+fn expand_tilde(input: &str) -> String {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => PathBuf::from(h),
+        None => return input.to_string(),
+    };
+    if input == "~" {
+        return home.to_string_lossy().into_owned();
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        let mut p = home;
+        p.push(rest);
+        return p.to_string_lossy().into_owned();
+    }
+    input.to_string()
 }
 
 // ---------- View ------------------------------------------------------------
@@ -1045,31 +1286,27 @@ pub fn view(app: &App) -> Element<'_, Message> {
         ..Default::default()
     });
 
-    // Main column: menubar / pathbar / [dropdown if open] / body / status_bar.
+    // Main column: menubar / [menu strip if open] / pathbar / body / status_bar.
     //
-    // iced 0.13 doesn't ship a native overlay/menu widget, so we render
-    // dropdowns and context menus as inline panels rather than true
-    // overlays. The menubar dropdown pushes the body down by its height
-    // while open; the context menu appears inside a row alongside the
-    // sidebar+grid body. Both close on any click outside their items
-    // (handled by the toggle/CloseMenus message arms in update()).
-    let mut main_col = column![menubar_el, pathbar].spacing(0);
+    // iced 0.13 doesn't ship a native overlay/menu widget, so menus
+    // render as a horizontal strip of item buttons directly below the
+    // menubar (the Scitano style) rather than as vertical dropdown
+    // popups. The menubar's open menu and the grid's right-click context
+    // menu are mutually exclusive and share the same strip slot, so the
+    // strip always appears in one predictable place and pushes the
+    // content below it down by one row while open. Both close on any
+    // click outside their items (handled by the toggle/CloseMenus
+    // message arms in update()).
+    let mut main_col = column![menubar_el];
 
-    if let Some(dropdown) = menubar::dropdown(app) {
-        main_col = main_col.push(dropdown);
+    if let Some(strip) = menubar::strip(app) {
+        main_col = main_col.push(strip);
+    } else if let Some(ctx_menu) = context_menu::view(app) {
+        main_col = main_col.push(ctx_menu);
     }
 
-    // If a context menu is open, render it as a panel to the right of
-    // the sidebar+grid body. Clicking any item in it emits the item's
-    // message AND we manually close via the item's handler (or the
-    // user can press Escape).
-    if let Some(ctx_menu) = context_menu::view(app) {
-        let with_menu = row![body, ctx_menu].spacing(0).height(Length::Fill);
-        main_col = main_col.push(with_menu);
-    } else {
-        main_col = main_col.push(body);
-    }
-
+    main_col = main_col.push(pathbar);
+    main_col = main_col.push(body);
     main_col = main_col.push(status_bar);
 
     main_col.spacing(0).height(Length::Fill).into()
@@ -1083,7 +1320,9 @@ pub fn subscription(app: &App) -> Subscription<Message> {
 
     // Scan: one-shot per (dir, scan_id). The closure captures the dir at
     // subscription creation time; bumping scan_id drops the old sub and
-    // starts a new one with the new dir.
+    // starts a new one with the new dir. Every message is tagged with the
+    // dir so update() can drop stale events that were already in flight
+    // when the user navigated away.
     let scan_sub = Subscription::run_with_id(
         ("scan", scan_id),
         stream::channel(256, move |mut tx| {
@@ -1097,7 +1336,8 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                 });
                 while let Some(event) = vfs_rx.recv().await {
                     // iced's futures::mpsc::Sender uses an async `send`.
-                    if tx.send(Message::ScanEvent(event)).await.is_err() {
+                    let msg = Message::ScanEvent { dir: dir.clone(), event };
+                    if tx.send(msg).await.is_err() {
                         break; // UI dropped the receiver — pane closed.
                     }
                 }
@@ -1122,7 +1362,8 @@ pub fn subscription(app: &App) -> Subscription<Message> {
                     }
                 };
                 while let Some(event) = vfs_rx.recv().await {
-                    if tx.send(Message::WatchEvent(event)).await.is_err() {
+                    let msg = Message::WatchEvent { dir: dir.clone(), event };
+                    if tx.send(msg).await.is_err() {
                         break;
                     }
                 }
@@ -1210,5 +1451,386 @@ pub(crate) fn format_size(bytes: u64) -> String {
         format!("{} {}", bytes, UNITS[0])
     } else {
         format!("{:.1} {}", value, UNITS[unit_idx])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::EntryKind;
+    use std::time::SystemTime;
+
+    /// A minimal `App` pointing at `dir`, with config/mounts isolated from
+    /// the developer's real `~/.config/runar`.
+    fn test_app(dir: &str) -> App {
+        let mut app = App::new(PathBuf::from(dir));
+        app.config = Config::default();
+        app
+    }
+
+    fn file_entry(dir: &Path, name: &str, kind: EntryKind) -> FileEntry {
+        let hidden = name.starts_with('.');
+        FileEntry {
+            path: dir.join(name),
+            name: name.to_string(),
+            kind,
+            size: 42,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            readable: true,
+            writable: true,
+            executable: false,
+            mime_type: None,
+            hidden,
+        }
+    }
+
+    fn scan_event(dir: &Path, entry: FileEntry) -> Message {
+        Message::ScanEvent {
+            dir: dir.to_path_buf(),
+            event: ScanEvent::Entry(entry),
+        }
+    }
+
+    #[test]
+    fn scan_entries_are_sorted_dirs_first_case_insensitive() {
+        let dir = Path::new("/tmp/runar-ui-test-sort");
+        let mut app = test_app("/tmp/runar-ui-test-sort");
+
+        // Feed entries in scrambled, case-mixed order.
+        for (name, kind) in [
+            ("zebra.txt", EntryKind::File),
+            ("Bravo", EntryKind::Directory),
+            ("apple.md", EntryKind::File),
+            ("alpha", EntryKind::AppDir { launcher: dir.join("alpha/run") }),
+            (".dotfile", EntryKind::File),
+        ] {
+            let _ = update(&mut app, scan_event(dir, file_entry(dir, name, kind)));
+        }
+
+        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            // Directories first (alpha < Bravo case-insensitively), then
+            // files (".dotfile" < "apple.md" < "zebra.txt" in byte order).
+            vec!["alpha", "Bravo", ".dotfile", "apple.md", "zebra.txt"],
+            "directories/AppDirs must sort before files, names case-insensitive"
+        );
+    }
+
+    #[test]
+    fn upsert_replaces_existing_entry_without_duplicating() {
+        let dir = Path::new("/tmp/runar-ui-test-upsert");
+        let mut app = test_app("/tmp/runar-ui-test-upsert");
+        let _ = update(
+            &mut app,
+            scan_event(dir, file_entry(dir, "a.txt", EntryKind::File)),
+        );
+        // Same path again (e.g. created mid-scan and seen by both the
+        // scanner and inotify) must replace, not append.
+        let mut again = file_entry(dir, "a.txt", EntryKind::File);
+        again.size = 999;
+        let _ = update(&mut app, Message::UpsertEntry(again));
+
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].size, 999);
+    }
+
+    #[test]
+    fn stale_scan_events_from_previous_directory_are_dropped() {
+        let mut app = test_app("/tmp/runar-ui-test-stale");
+        // Event tagged with a different directory than current_dir:
+        // already in flight when the user navigated — must not land.
+        let _ = update(
+            &mut app,
+            scan_event(
+                Path::new("/elsewhere"),
+                file_entry(Path::new("/elsewhere"), "ghost.txt", EntryKind::File),
+            ),
+        );
+        assert!(
+            app.entries.is_empty(),
+            "stale scan events must not contaminate the new listing"
+        );
+    }
+
+    #[test]
+    fn selection_shifts_when_entry_inserted_before_it() {
+        let dir = Path::new("/tmp/runar-ui-test-selshift");
+        let mut app = test_app("/tmp/runar-ui-test-selshift");
+        let _ = update(
+            &mut app,
+            scan_event(dir, file_entry(dir, "a.txt", EntryKind::File)),
+        );
+        let _ = update(
+            &mut app,
+            scan_event(dir, file_entry(dir, "z.txt", EntryKind::File)),
+        );
+        app.selected = Some(1); // z.txt
+
+        let _ = update(
+            &mut app,
+            scan_event(dir, file_entry(dir, "m.txt", EntryKind::File)),
+        );
+
+        assert_eq!(app.entries.len(), 3);
+        assert_eq!(app.selected, Some(2), "selection must follow z.txt down");
+        assert_eq!(app.entries[app.selected.unwrap()].name, "z.txt");
+    }
+
+    #[test]
+    fn selection_clamps_when_selected_row_removed() {
+        let dir = Path::new("/tmp/runar-ui-test-selrm");
+        let mut app = test_app("/tmp/runar-ui-test-selrm");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            let _ = update(
+                &mut app,
+                scan_event(dir, file_entry(dir, n, EntryKind::File)),
+            );
+        }
+        app.selected = Some(1); // b.txt
+
+        let _ = update(
+            &mut app,
+            Message::WatchEvent {
+                dir: dir.to_path_buf(),
+                event: WatchEvent::Removed(dir.join("b.txt")),
+            },
+        );
+
+        assert_eq!(app.entries.len(), 2);
+        assert_eq!(app.selected, Some(1), "selection must clamp to the new last row");
+        assert_eq!(app.entries[1].name, "c.txt");
+    }
+
+    #[test]
+    fn watch_removed_ignores_paths_outside_current_dir() {
+        let mut app = test_app("/tmp/runar-ui-test-foreign");
+        let _ = update(
+            &mut app,
+            scan_event(
+                Path::new("/tmp/runar-ui-test-foreign"),
+                file_entry(Path::new("/tmp/runar-ui-test-foreign"), "keep.txt", EntryKind::File),
+            ),
+        );
+        // A rename destination (or removal) outside the watched dir must
+        // not touch this listing.
+        let _ = update(
+            &mut app,
+            Message::WatchEvent {
+                dir: PathBuf::from("/tmp/runar-ui-test-foreign"),
+                event: WatchEvent::Removed(PathBuf::from("/etc/passwd")),
+            },
+        );
+        assert_eq!(app.entries.len(), 1);
+    }
+
+    #[test]
+    fn move_selection_skips_hidden_entries_when_hidden() {
+        let dir = Path::new("/tmp/runar-ui-test-nav");
+        let mut app = test_app("/tmp/runar-ui-test-nav");
+        for (n, k) in [
+            ("a.txt", EntryKind::File),
+            (".hidden", EntryKind::File),
+            ("c.txt", EntryKind::File),
+        ] {
+            let _ = update(&mut app, scan_event(dir, file_entry(dir, n, k)));
+        }
+        // Sorted order puts the dotfile first: [".hidden", "a.txt", "c.txt"].
+        app.show_hidden = false;
+        app.selected = Some(1); // a.txt
+
+        // Down from a.txt must land on c.txt (index 2), skipping the
+        // invisible .hidden row (index 0).
+        move_selection(&mut app, 1);
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.entries[2].name, "c.txt");
+
+        // And back up lands on a.txt again.
+        move_selection(&mut app, -1);
+        assert_eq!(app.selected, Some(1));
+    }
+
+    #[test]
+    fn move_selection_from_hidden_selection_finds_visible_anchor() {
+        let dir = Path::new("/tmp/runar-ui-test-nav2");
+        let mut app = test_app("/tmp/runar-ui-test-nav2");
+        for (n, k) in [
+            ("a.txt", EntryKind::File),
+            (".hidden", EntryKind::File),
+        ] {
+            let _ = update(&mut app, scan_event(dir, file_entry(dir, n, k)));
+        }
+        // Sorted order: [".hidden", "a.txt"]. A stale selection pointing
+        // at the hidden row (e.g. set before hidden files were hidden)
+        // re-anchors on a visible row when the user navigates.
+        app.show_hidden = false;
+        app.selected = Some(0);
+        move_selection(&mut app, 1);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.entries[1].name, "a.txt");
+    }
+
+    #[test]
+    fn grid_click_closes_open_menus() {
+        use menubar::MenuKind;
+        let dir = Path::new("/tmp/runar-ui-test-menus");
+        let mut app = test_app("/tmp/runar-ui-test-menus");
+        let _ = update(
+            &mut app,
+            scan_event(dir, file_entry(dir, "a.txt", EntryKind::File)),
+        );
+        app.open_menu = Some(MenuKind::File);
+        app.context_menu_target = Some(0);
+
+        let _ = update(&mut app, Message::EntryClicked(0));
+
+        assert_eq!(app.open_menu, None, "clicking the grid must close menu strips");
+        assert_eq!(app.context_menu_target, None);
+        assert_eq!(app.selected, Some(0), "row click still selects the row");
+    }
+
+    #[test]
+    fn open_in_terminal_is_a_menu_action_that_closes_menus() {
+        let mut app = test_app("/tmp/runar-ui-test-term");
+        app.open_menu = Some(menubar::MenuKind::Go);
+        app.context_menu_target = Some(0);
+
+        let _ = update(
+            &mut app,
+            Message::OpenInTerminal(PathBuf::from("/tmp/runar-ui-test-term")),
+        );
+
+        assert_eq!(app.open_menu, None, "Open in Terminal must close its menu");
+        assert_eq!(app.context_menu_target, None);
+    }
+
+    #[test]
+    fn context_menu_strip_follows_right_click_target() {
+        let dir = Path::new("/tmp/runar-ui-test-ctx");
+        let mut app = test_app("/tmp/runar-ui-test-ctx");
+        let _ = update(
+            &mut app,
+            scan_event(dir, file_entry(dir, "a.txt", EntryKind::File)),
+        );
+        assert!(context_menu::view(&app).is_none(), "no menu before right-click");
+
+        let _ = update(&mut app, Message::EntryRightClicked(0));
+        assert!(context_menu::view(&app).is_some(), "right-click opens the strip");
+
+        // A stale target (entries changed since the click) shows nothing
+        // rather than panicking.
+        app.entries.clear();
+        assert!(context_menu::view(&app).is_none());
+    }
+
+    #[test]
+    fn menubar_strip_and_context_strip_are_mutually_exclusive() {
+        use menubar::MenuKind;
+        let dir = Path::new("/tmp/runar-ui-test-mutex");
+        let mut app = test_app("/tmp/runar-ui-test-mutex");
+        let _ = update(
+            &mut app,
+            scan_event(dir, file_entry(dir, "a.txt", EntryKind::File)),
+        );
+
+        // Opening the context menu closes a menubar strip...
+        app.open_menu = Some(MenuKind::File);
+        let _ = update(&mut app, Message::EntryRightClicked(0));
+        assert_eq!(app.open_menu, None);
+        assert!(context_menu::view(&app).is_some());
+        assert!(menubar::strip(&app).is_none());
+
+        // ...and opening a menubar strip closes the context menu.
+        let _ = update(&mut app, Message::MenuToggled(MenuKind::View));
+        assert_eq!(app.context_menu_target, None);
+        assert!(menubar::strip(&app).is_some());
+        assert!(context_menu::view(&app).is_none());
+    }
+
+    #[test]
+    fn drag_hover_exit_is_guarded_by_row_index() {
+        let mut app = test_app("/tmp/runar-ui-test-drag");
+        app.drag_source = Some(PathBuf::from("/tmp/runar-ui-test-drag/proj"));
+
+        // Enter bookmark 1, then the (out-of-order) exit of bookmark 0
+        // arrives — the hover on 1 must survive.
+        let _ = update(&mut app, Message::DragEnteredBookmark(1));
+        let _ = update(&mut app, Message::DragExitedBookmark(0));
+        assert_eq!(app.drag_hover_bookmark, Some(1));
+
+        let _ = update(&mut app, Message::DragExitedBookmark(1));
+        assert_eq!(app.drag_hover_bookmark, None);
+    }
+
+    #[test]
+    fn expand_tilde_expands_home_prefix() {
+        match std::env::var("HOME") {
+            Ok(home) => {
+                assert_eq!(expand_tilde("~"), home);
+                assert_eq!(expand_tilde("~/Downloads"), format!("{home}/Downloads"));
+                // Non-tilde and ~user forms pass through untouched.
+                assert_eq!(expand_tilde("/etc"), "/etc");
+                assert_eq!(expand_tilde("~other/x"), "~other/x");
+                assert_eq!(expand_tilde("relative/path"), "relative/path");
+            }
+            // Env not set in this environment: expansion must be a no-op.
+            Err(_) => {
+                assert_eq!(expand_tilde("~/Downloads"), "~/Downloads");
+            }
+        }
+    }
+
+    #[test]
+    fn pathbar_submit_expands_tilde_and_navigates() {
+        let Ok(home) = std::env::var("HOME") else {
+            return; // no $HOME in this environment — nothing to assert
+        };
+        let mut app = test_app("/tmp/runar-ui-test-pathbar");
+        let _ = update(&mut app, Message::PathBarEdit("~".into()));
+        let _ = update(&mut app, Message::PathBarSubmit);
+        assert_eq!(app.current_dir, PathBuf::from(&home));
+        assert!(!app.pathbar_editing);
+    }
+
+    #[test]
+    fn pathbar_submit_trims_whitespace() {
+        let mut app = test_app("/tmp/runar-ui-test-trim");
+        let _ = update(&mut app, Message::PathBarEdit("/etc  ".into()));
+        let _ = update(&mut app, Message::PathBarSubmit);
+        assert_eq!(app.current_dir, PathBuf::from("/etc"));
+    }
+
+    #[test]
+    fn pathbar_submit_empty_input_just_closes_editor() {
+        let mut app = test_app("/tmp/runar-ui-test-empty");
+        let before = app.current_dir.clone();
+        let _ = update(&mut app, Message::PathBarEdit("   ".into()));
+        let _ = update(&mut app, Message::PathBarSubmit);
+        assert_eq!(app.current_dir, before);
+        assert!(!app.pathbar_editing);
+    }
+
+    #[test]
+    fn pathbar_submit_missing_path_reports_error() {
+        let mut app = test_app("/tmp/runar-ui-test-missing");
+        let bogus = "/tmp/runar-ui-test-missing-does-not-exist-xyz";
+        let _ = update(&mut app, Message::PathBarEdit(bogus.into()));
+        let _ = update(&mut app, Message::PathBarSubmit);
+        assert!(app.status.contains("no such directory"), "status: {}", app.status);
+        // Navigating nowhere: current_dir unchanged.
+        assert_eq!(app.current_dir, PathBuf::from("/tmp/runar-ui-test-missing"));
+    }
+
+    #[test]
+    fn ctrl_r_reloads_current_directory() {
+        use iced::keyboard::{Key, Modifiers};
+        let mut app = test_app("/tmp/runar-ui-test-ctrlr");
+        let before = app.scan_id;
+        let _ = update(
+            &mut app,
+            Message::KeyPressed(Key::Character("r".into()), Modifiers::CTRL),
+        );
+        assert_eq!(app.scan_id, before.wrapping_add(1), "Ctrl+R must bump scan_id");
+        assert_eq!(app.open_menu, None, "Reload must close any open menu");
     }
 }

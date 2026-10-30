@@ -16,14 +16,18 @@
 //! tokio tasks via iced subscriptions; the UI thread never blocks.
 //!
 //! Key bindings (Phase 2 keyboard-first navigation):
-//!   * Arrow Up / Down  — move selection
+//!   * Arrow Up / Down  — move selection (skips hidden rows when hidden)
 //!   * J / K            — same (vim-style)
 //!   * H / L            — go up / enter selection
 //!   * Enter            — activate selection (open / launch / navigate)
-//!   * Backspace       — go up one directory
+//!   * Backspace        — go up one directory
+//!   * Alt+Up           — go up one directory (Go menu binding)
 //!   * /  or  Ctrl+L   — toggle pathbar edit mode
-//!   * Escape          — exit pathbar edit mode (only when editing)
-//!   * Shift+Enter     — on an AppDir, enter it as a directory
+//!   * Ctrl+H           — toggle hidden files
+//!   * Ctrl+R           — reload current directory
+//!   * Ctrl+D           — bookmark current directory
+//!   * Escape           — exit pathbar edit mode (only when editing)
+//!   * Shift+Enter      — on an AppDir, enter it as a directory
 //!
 //! Usage: runar [directory]   (defaults to current directory)
 

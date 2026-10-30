@@ -13,7 +13,6 @@
 pub mod appdir;
 pub mod watcher;
 
-use mime_guess::MimeGuess;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -130,7 +129,11 @@ pub async fn scan_directory(dir: PathBuf, tx: UnboundedSender<ScanEvent>) {
     let _ = tx.send(ScanEvent::Done { dir, total });
 }
 
-async fn build_file_entry(path: &Path) -> std::io::Result<FileEntry> {
+/// Build a `FileEntry` for a single path (stat + AppDir probe + MIME
+/// guess). Used by the scanner for every directory entry, and by the UI's
+/// incremental watch-event handling to (re)stat a single entry when
+/// inotify reports it created/modified/renamed.
+pub(crate) async fn build_file_entry(path: &Path) -> std::io::Result<FileEntry> {
     // Use symlink_metadata first so we can tell a symlink from its target
     // without silently following it.
     let link_meta = tokio::fs::symlink_metadata(path).await?;
@@ -177,10 +180,11 @@ async fn build_file_entry(path: &Path) -> std::io::Result<FileEntry> {
     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let modified = meta.as_ref().and_then(|m| m.modified().ok());
 
+    // MIME lookup goes through the centralized resolver: /etc/mime.types
+    // (when the sysadmin maintains one) layered over mime_guess's
+    // compiled-in table — never xdg.
     let mime_type = if matches!(kind, EntryKind::File) {
-        MimeGuess::from_path(path)
-            .first()
-            .map(|m| m.essence_str().to_string())
+        crate::mime::resolve_mime_type(path)
     } else {
         None
     };

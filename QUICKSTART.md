@@ -62,23 +62,27 @@ Double-click any file (or select it and press Enter) and runar launches it throu
 
 1. **Your `actions.toml` overrides** (covered in the next section) — highest priority.
 2. **Built-in default MIME table** — sensible power-user defaults for common types, no config required.
-3. **`xdg-open`** — final fallback that defers to your system's defaults.
+3. **Direct execution** — if the file itself carries an executable bit, run it (the ROX-Filer convention). Otherwise runar reports "no handler" — there is no `xdg-open` and no system MIME database to defer to; the fix is a line in `actions.toml`.
 
-The built-in table honors standard environment variables so it works the way you expect on any system:
+The built-in table honors standard environment variables ($EDITOR, $BROWSER, $IMAGE_VIEWER, $VIDEO_PLAYER, $AUDIO_PLAYER, $PDF_VIEWER) and then walks a chain of known binaries, lightest first — so it works on a minimal SliTaz-style install as well as a full desktop, with no xdg anywhere:
 
 | MIME category | Default action |
 |---|---|
-| `text/*` (plain, markdown, csv, source code) | `$EDITOR` if set, else walks: `scitano` → `scite` → `geany` → `nano` |
-| `text/html` | `${BROWSER:-xdg-open} {}` |
-| `image/*` | `${IMAGE_VIEWER:-xdg-open} {}` |
-| `video/*` | `${VIDEO_PLAYER:-xdg-open} {}` |
-| `audio/*` | `${AUDIO_PLAYER:-xdg-open} {}` |
-| `application/pdf` | `${PDF_VIEWER:-xdg-open} {}` |
+| `text/*` (plain, markdown, csv, source code) | `$EDITOR` if set, else walks: `scitano` → `scite` → `geany` → `kate` → `mousepad` |
+| `text/html` | `$BROWSER` if set, else: `firefox` → `librewolf` → `zen` → `mullvad-browser` → `swell` → `ladybird` → `gnomeweb`/`epiphany` → `netsurf` |
+| `image/*` | `$IMAGE_VIEWER` if set, else: `marten` → `gpicview` → `gphoto2` |
+| `video/*` | `$VIDEO_PLAYER` if set, else: `ferret` → `smplayer` → `mpv` → `vlc` |
+| `audio/*` | `$AUDIO_PLAYER` if set, else: `mpv` → `mplayer` → `audacious` → `deadbeef` |
+| `application/pdf` | `$PDF_VIEWER` if set, else: `evince` → `atril` |
 | `application/json`, `/yaml`, `/toml`, `/xml` | Same editor chain as `text/*` |
 | `application/x-shellscript` | Same editor chain as `text/*` |
 | `application/zip`, `/x-tar`, `/gzip`, etc. | `ls -l {}` (list contents, don't extract) |
 
-**Editor fallback chain:** for any text-type file, runar tries (in order) `$EDITOR` (if set in your shell), then `scitano`, `scite`, `geany`, and finally `nano`. The first one found on `$PATH` wins. This means out-of-the-box on a typical Linux install with `nano` present, double-clicking a `.txt` opens it in `nano`; install `scite` and it becomes the default; set `EDITOR=code` in your shell and VS Code wins. No config file required.
+**Editor fallback chain:** for any text-type file, runar tries (in order) `$EDITOR` (if set in your shell), then `scitano`, `scite`, `geany`, `kate`, and finally `mousepad`. The first one found on `$PATH` wins. This means on a bare install with only `mousepad` present, double-clicking a `.txt` opens it in `mousepad`; install `scite` and it becomes the default; set `EDITOR=code` in your shell and VS Code wins. No config file required.
+
+**Terminal emulator** (used by "Open in Terminal" in the right-click menu): `$TERMINAL` if set, else walks `rs-mrxvt` → `mrxvt` → `urxvt` → `ghostty` → `alacritty` → `tabby` → `guake`. The terminal opens with its shell already in the folder you clicked — right-clicking a directory/AppDir opens that folder, right-clicking a file opens the folder containing it.
+
+**Where MIME types come from:** extension → MIME resolution is self-contained, in two layers. If `/etc/mime.types` exists, runar parses that simple flat file itself (once per process, then cached) and honors it; otherwise — or for extensions it doesn't cover — runar falls back to a table compiled into the binary. There is no `shared-mime-info`, no `xdg-mime`, and no desktop database anywhere in the pipeline.
 
 To override per-extension with your own chain: see the next section.
 
@@ -117,14 +121,14 @@ You do not need to restart runar for changes to take effect; `actions.toml` is r
 ```toml
 [[actions]]
 pattern = "txt"
-commands = ["scitano {}", "scite {}", "geany {}", "nano {}"]
+commands = ["scitano {}", "scite {}", "geany {}", "kate {}"]
 ```
 
-If every command in the chain fails the `$PATH` check, runar falls through to the built-in MIME table, then to `xdg-open`. The chain is checked statically (runar parses the leading binary name and verifies it exists on `$PATH` before spawning) so a missing binary doesn't pay the cost of a failed `sh -c` invocation.
+If every command in the chain fails the `$PATH` check, runar falls through to the built-in MIME table, and finally runs the file directly if it carries an executable bit (the ROX-Filer convention). The chain is checked statically (runar parses the leading binary name and verifies it exists on `$PATH` before spawning) so a missing binary doesn't pay the cost of a failed `sh -c` invocation.
 
 ## 7. Top Menubar and Right-Click Context Menu
 
-runar ships with a traditional top menubar — **File / Edit / View / Go / Bookmarks / Help** — inspired by Thunar and PCManFM. Click any menu button to open its dropdown; click again or press Escape to close. Menu entries that aren't wired yet (Rename, Delete, Cut, Copy, Paste, Properties) are listed but emit a "not implemented yet" status-bar message so you can see the click registered. The wired entries include:
+runar ships with a traditional top menubar — **File / Edit / View / Go / Bookmarks / Help** — inspired by Thunar and PCManFM. Click any menu button to open its entries as a horizontal strip of buttons directly below the bar (the same interaction as the Scitano editor); long menus scroll sideways with a hidden scrollbar. Click again or press Escape to close. Menu entries that aren't wired yet (Rename, Delete, Cut, Copy, Paste, Properties) are listed but emit a "not implemented yet" status-bar message so you can see the click registered. The wired entries include:
 
 - **File → Open** (Enter) — activates the selected entry
 - **File → Reload** (Ctrl+R) — rescan the current directory

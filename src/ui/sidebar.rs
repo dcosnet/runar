@@ -84,7 +84,7 @@ pub fn view<'a>(app: &'a super::App) -> Element<'a, Message> {
         };
         bookmarks_col = bookmarks_col.push(mouse_area(zone)
             .on_enter(Message::DragEnteredBookmarkAppendZone)
-            .on_exit(Message::DragExitedBookmarks));
+            .on_exit(Message::DragExitedBookmarkAppendZone));
     } else {
         // Non-empty: show a small drop zone below the last entry.
         let zone_height = if is_append_target { 24.0 } else { 12.0 };
@@ -107,7 +107,7 @@ pub fn view<'a>(app: &'a super::App) -> Element<'a, Message> {
             });
         bookmarks_col = bookmarks_col.push(mouse_area(zone)
             .on_enter(Message::DragEnteredBookmarkAppendZone)
-            .on_exit(Message::DragExitedBookmarks));
+            .on_exit(Message::DragExitedBookmarkAppendZone));
     }
 
     let content = column![
@@ -263,7 +263,7 @@ fn bookmark_row(
     mouse_area(styled)
         .on_press(Message::BookmarkSelected(entry.path.clone()))
         .on_enter(Message::DragEnteredBookmark(idx))
-        .on_exit(Message::DragExitedBookmarks)
+        .on_exit(Message::DragExitedBookmark(idx))
         .into()
 }
 

@@ -1,9 +1,11 @@
 //! Top menubar — File / Edit / View / Go / Bookmarks / Help.
 //!
 //! iced 0.13 doesn't ship a native menubar widget, so we build one from
-//! `button` primitives. Each menu button toggles a dropdown panel that
-//! overlays the layout below it (rendered by `ui::view` when
-//! `app.open_menu` matches).
+//! `button` primitives. Clicking a menu button opens the menu as a
+//! HORIZONTAL STRIP of item buttons directly below the bar — the same
+//! interaction Scitano uses — rather than a vertical dropdown stack.
+//! The strip scrolls horizontally (scrollbar hidden) when its items
+//! overflow the window width. Escape or a click elsewhere closes it.
 //!
 //! ## Menu structure
 //!
@@ -21,7 +23,7 @@
 //! in the README roadmap.
 
 use super::Message;
-use iced::widget::{button, container, row, text, Space};
+use iced::widget::{button, container, row, text, Space, scrollable};
 use iced::{Alignment, Color, Element, Length};
 use std::path::PathBuf;
 
@@ -58,14 +60,15 @@ impl MenuKind {
     ];
 }
 
-/// A single entry in a dropdown menu.
+/// A single entry in a menu strip.
 #[derive(Debug, Clone)]
 pub struct MenuItem {
     pub label: String,
     pub message: Message,
-    /// Optional shortcut hint shown on the right (e.g. "Enter", "Ctrl+L").
+    /// Optional shortcut hint shown after the label (e.g. "Ctrl+L").
     pub shortcut: Option<&'static str>,
     /// True for separators (label is ignored, message is never emitted).
+    /// Rendered as a fixed-width gap in the horizontal strip.
     pub is_separator: bool,
     /// True if this entry is grayed out (e.g. "Paste" when clipboard empty).
     pub disabled: bool,
@@ -108,23 +111,7 @@ impl MenuItem {
         }
     }
 
-    /// Disabled entry with a shortcut hint (shortcut is currently
-    /// dropped — disabled entries don't render their shortcut — but the
-    /// method exists so call sites are symmetric with `entry_with_shortcut`).
-    pub fn disabled_entry_with_shortcut(
-        label: impl Into<String>,
-        _shortcut: &'static str,
-    ) -> Self {
-        Self {
-            label: label.into(),
-            message: Message::Noop,
-            shortcut: None,
-            is_separator: false,
-            disabled: true,
-        }
-    }
-
-    /// Horizontal separator line.
+    /// Horizontal separator line — a fixed-width gap in the strip.
     pub fn separator() -> Self {
         Self {
             label: String::new(),
@@ -137,8 +124,8 @@ impl MenuItem {
 }
 
 /// Build the menubar (a horizontal row of menu buttons). Returns the
-/// bar element; the actual dropdown panel is rendered separately by
-/// `ui::view` based on `app.open_menu`.
+/// bar element; the open menu's strip is rendered separately by
+/// `strip` / `strip_from_items`.
 pub fn view<'a>(app: &'a super::App) -> Element<'a, Message> {
     let mut bar = row![].spacing(0).align_y(Alignment::Center);
 
@@ -147,18 +134,13 @@ pub fn view<'a>(app: &'a super::App) -> Element<'a, Message> {
         let btn = button(text(kind.label()).size(13))
             .padding([4, 10])
             .style(move |theme: &iced::Theme, status: button::Status| {
-                let base = button::secondary(theme, status);
+                let base = menu_strip_button_style(theme, status);
                 let bg = if is_open {
                     Some(Color::from_rgb(0.18, 0.32, 0.55).into())
-                } else if matches!(status, button::Status::Hovered) {
-                    Some(Color::from_rgb(0.18, 0.18, 0.20).into())
                 } else {
-                    None
+                    base.background
                 };
-                button::Style {
-                    background: bg.or(base.background),
-                    ..base
-                }
+                button::Style { background: bg, ..base }
             })
             .on_press(Message::MenuToggled(kind));
         bar = bar.push(btn);
@@ -181,38 +163,102 @@ pub fn view<'a>(app: &'a super::App) -> Element<'a, Message> {
         .into()
 }
 
-/// Build the dropdown panel for the currently-open menu. Returns None
-/// if no menu is open.
-pub fn dropdown<'a>(app: &'a super::App) -> Option<Element<'a, Message>> {
+/// Build the horizontal strip for the currently-open menubar menu.
+/// Returns None if no menu is open. Rendered directly below the menubar,
+/// Scitano-style: a row of flat item buttons that scrolls horizontally
+/// (hidden scrollbar) when the items overflow the window width.
+pub fn strip(app: &super::App) -> Option<Element<'_, Message>> {
     let kind = app.open_menu()?;
-    let items = menu_items_for(kind, app);
+    Some(strip_from_items(menu_items_for(kind, app)))
+}
 
-    let mut col = iced::widget::column![].spacing(0).padding([4, 0]);
+/// Render a list of menu items as the horizontal strip. Shared by the
+/// menubar strips and the right-click context menu, which Scitano
+/// treats as the same overlay mechanism.
+pub fn strip_from_items(items: Vec<MenuItem>) -> Element<'static, Message> {
+    let mut r = row![].spacing(2).align_y(Alignment::Center);
 
     for item in items {
         if item.is_separator {
-            col = col.push(separator());
+            r = r.push(Space::new(Length::Fixed(12.0), Length::Fixed(0.0)));
         } else if item.disabled {
-            col = col.push(disabled_row(item.label));
+            r = r.push(
+                text(item.label)
+                    .size(12)
+                    .color(Color::from_rgb(0.45, 0.45, 0.5)),
+            );
         } else {
-            col = col.push(entry_row(item.label, item.shortcut, item.message));
+            let mut content = row![text(item.label).size(12)]
+                .spacing(6)
+                .align_y(Alignment::Center);
+            if let Some(s) = item.shortcut {
+                if !s.is_empty() {
+                    content = content.push(
+                        text(s)
+                            .size(10)
+                            .color(Color::from_rgb(0.55, 0.55, 0.6)),
+                    );
+                }
+            }
+            r = r.push(
+                button(content)
+                    .padding([3, 10])
+                    .style(menu_strip_button_style)
+                    .on_press(item.message),
+            );
         }
     }
 
-    Some(
-        container(col)
-            .width(220)
-            .style(|_: &iced::Theme| container::Style {
-                background: Some(Color::from_rgb(0.14, 0.14, 0.16).into()),
-                border: iced::Border {
-                    color: Color::from_rgb(0.30, 0.30, 0.34),
-                    width: 1.0,
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            })
-            .into(),
-    )
+    // Horizontal-only scrolling with a zero-width scrollbar: long menus
+    // (Go → locations, Bookmarks) overflow by panning, never wrapping.
+    let scrolled = scrollable(r).direction(
+        iced::widget::scrollable::Direction::Horizontal(
+            iced::widget::scrollable::Scrollbar::new().width(0).margin(0),
+        ),
+    );
+
+    container(scrolled)
+        .width(Length::Fill)
+        .style(strip_container_style)
+        .padding([4, 12])
+        .into()
+}
+
+/// Flat, borderless button style for strip items — transparent at rest,
+/// a subtle raise on hover, and the selection blue while pressed. This
+/// is Scitano's `menu_button` look.
+fn menu_strip_button_style(
+    _theme: &iced::Theme,
+    status: button::Status,
+) -> button::Style {
+    let background = match status {
+        button::Status::Hovered => Some(Color::from_rgb(0.18, 0.18, 0.20).into()),
+        button::Status::Pressed => Some(Color::from_rgb(0.18, 0.32, 0.55).into()),
+        _ => None,
+    };
+    button::Style {
+        background,
+        text_color: Color::from_rgb(0.92, 0.92, 0.93),
+        border: iced::Border {
+            radius: 0.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Full-width panel behind the strip — same tones as the old dropdown
+/// panel, squared off to read as a bar rather than a popup.
+fn strip_container_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgb(0.14, 0.14, 0.16).into()),
+        border: iced::Border {
+            color: Color::from_rgb(0.30, 0.30, 0.34),
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    }
 }
 
 /// Build the list of items for a given menu, considering app state
@@ -274,7 +320,7 @@ fn menu_items_for(kind: MenuKind, app: &super::App) -> Vec<MenuItem> {
                 "Ctrl+C",
                 Message::NotImplemented("Copy"),
             ),
-            MenuItem::disabled_entry_with_shortcut("Paste", "Ctrl+V"),
+            MenuItem::disabled_entry("Paste"),
             MenuItem::separator(),
             MenuItem::entry_with_shortcut(
                 "Select All",
@@ -406,52 +452,39 @@ fn menu_items_for(kind: MenuKind, app: &super::App) -> Vec<MenuItem> {
     }
 }
 
-fn entry_row<'a>(
-    label: String,
-    shortcut: Option<&'static str>,
-    message: Message,
-) -> Element<'a, Message> {
-    let mut r = iced::widget::row![
-        text(label).size(13).color(Color::from_rgb(0.92, 0.92, 0.93)),
-        Space::new(Length::Fill, 0),
-    ]
-    .align_y(Alignment::Center);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::App;
+    use std::path::PathBuf;
 
-    if let Some(s) = shortcut {
-        if !s.is_empty() {
-            r = r.push(
-                text(s)
-                    .size(11)
-                    .color(Color::from_rgb(0.55, 0.55, 0.6)),
-            );
-        }
+    #[test]
+    fn strip_only_when_menu_is_open() {
+        let mut app = App::new(PathBuf::from("/tmp/runar-menubar-test"));
+        assert!(strip(&app).is_none(), "no strip with no menu open");
+
+        app.open_menu = Some(MenuKind::View);
+        assert!(strip(&app).is_some(), "open menu must produce a strip");
     }
 
-    button(r)
-        .padding([4, 10])
-        .width(Length::Fill)
-        .style(button::secondary)
-        .on_press(message)
-        .into()
-}
+    #[test]
+    fn strip_renders_all_item_shapes() {
+        // Smoke test: separators, disabled entries, shortcuts, and plain
+        // entries must all build into the strip without panicking.
+        let items = vec![
+            MenuItem::entry("Open", Message::Noop),
+            MenuItem::entry_with_shortcut("Reload", "Ctrl+R", Message::Noop),
+            MenuItem::separator(),
+            MenuItem::disabled_entry("Paste"),
+        ];
+        let _ = strip_from_items(items);
+    }
 
-fn disabled_row<'a>(label: String) -> Element<'a, Message> {
-    container(
-        text(label)
-            .size(13)
-            .color(Color::from_rgb(0.45, 0.45, 0.5)),
-    )
-    .padding([4, 10])
-    .width(Length::Fill)
-    .into()
-}
-
-fn separator<'a>() -> Element<'a, Message> {
-    container(Space::new(Length::Fill, 1))
-        .padding([2, 6])
-        .style(|_: &iced::Theme| container::Style {
-            background: Some(Color::from_rgb(0.28, 0.28, 0.32).into()),
-            ..Default::default()
-        })
-        .into()
+    #[test]
+    fn menubar_view_builds_with_and_without_open_menu() {
+        let mut app = App::new(PathBuf::from("/tmp/runar-menubar-test"));
+        let _ = view(&app);
+        app.open_menu = Some(MenuKind::Go);
+        let _ = view(&app);
+    }
 }

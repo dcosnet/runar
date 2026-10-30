@@ -26,13 +26,6 @@ mime_guess = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 
-# Fast utility
-rayon = "1.10"
-walkdir = "2.5"
-
-# Launch fallback (xdg-open equivalent, pure Rust)
-open = "5.3"
-
 # Logging (minimal)
 log = "0.4"
 env_logger = "0.11"

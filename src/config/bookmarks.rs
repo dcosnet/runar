@@ -52,15 +52,24 @@ impl Bookmarks {
 
     /// Insert a path at a specific index. Used by drag-and-drop when the
     /// user drops a folder between two existing bookmarks. If the path is
-    /// already bookmarked, it's moved to the new index (remove + reinsert).
-    /// The index is clamped to `[0, len]`.
+    /// already bookmarked, it's moved to the new index (remove + reinsert)
+    /// and its custom label is preserved. The index is clamped to
+    /// `[0, len]`.
     ///
     /// Returns true if the bookmark was inserted (or moved).
     pub fn insert_at(&mut self, path: PathBuf, index: usize) -> bool {
-        // Remove existing entry if present (this is a move, not a dup).
+        // Preserve the label of an existing entry — dropping a bookmarked
+        // folder onto a new slot is a move, and a move shouldn't silently
+        // clear a label the user set in bookmarks.toml.
+        let existing_label = self
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .and_then(|e| e.label.clone());
         self.entries.retain(|e| e.path != path);
         let clamped = index.min(self.entries.len());
-        self.entries.insert(clamped, BookmarkEntry { path, label: None });
+        self.entries
+            .insert(clamped, BookmarkEntry { path, label: existing_label });
         true
     }
 
@@ -68,6 +77,16 @@ impl Bookmarks {
         let before = self.entries.len();
         self.entries.retain(|e| e.path != path);
         self.entries.len() != before
+    }
+
+    /// Test-only helper: add a bookmark carrying a custom label, the way
+    /// a hand-written bookmarks.toml stanza would load.
+    #[cfg(test)]
+    pub fn add_with_label(&mut self, path: PathBuf, label: &str) {
+        self.entries.push(BookmarkEntry {
+            path,
+            label: Some(label.to_string()),
+        });
     }
 
     pub fn load(dir: &Path) -> Self {
@@ -220,4 +239,25 @@ mod tests {
         assert_eq!(bm.entries[1].path, PathBuf::from("/c"));
         assert_eq!(bm.entries[2].path, PathBuf::from("/a"));
     }
+
+    #[test]
+    fn insert_at_preserves_custom_label_on_move() {
+        // Drag-reordering a labeled bookmark must not silently clear the
+        // label the user set in bookmarks.toml.
+        let mut bm = Bookmarks::default();
+        bm.add(PathBuf::from("/a"));
+        bm.add_with_label(PathBuf::from("/mnt/big-disk"), "Data Disk");
+        bm.add(PathBuf::from("/c"));
+
+        bm.insert_at(PathBuf::from("/mnt/big-disk"), 0);
+
+        assert_eq!(bm.entries.len(), 3);
+        assert_eq!(bm.entries[0].path, PathBuf::from("/mnt/big-disk"));
+        assert_eq!(
+            bm.entries[0].label.as_deref(),
+            Some("Data Disk"),
+            "custom label must survive a drag-reorder"
+        );
+    }
 }
+

@@ -5,7 +5,7 @@
 [![license: GPL-2.0-only](https://img.shields.io/badge/license-GPL--2.0--only-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
 [![language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![toolkit: iced 0.13](https://img.shields.io/badge/toolkit-iced%200.13-blue.svg)](https://github.com/iced-rs/iced)
-[![tests: 21 passing](https://img.shields.io/badge/tests-83%20passing-brightgreen.svg)](#testing)
+[![tests: 113 passing](https://img.shields.io/badge/tests-113%20passing-brightgreen.svg)](#testing)
 <!-- TODO: CI badge, crates.io badge once published -->
 
 ![runar-ss](./runar-ss.png)
@@ -26,7 +26,7 @@ runar combines the clean dual-pane/tree-and-grid layout of Thunar/PCManFM with t
 
 Conventional GTK-based file managers tend to bundle a pile of assumptions about the surrounding desktop: they expect a settings daemon, a volume monitor service, an icon theme, and a curated set of XDG user directories like Music, Pictures, and Public. runar throws those assumptions out. The only thing it assumes is a mounted `/proc` filesystem and a working Linux kernel, which means it runs equally well on a workstation, a server, a Raspberry Pi, or a recovery live USB. This design choice is deliberate: the file manager should reflect what is actually on disk, not what a desktop integration layer believes ought to be there.
 
-The ROX-Filer lineage shows up most clearly in AppDir support and in the `actions.toml` MIME-hook system. AppDirs — directories that bundle an application together with its icons and resources, launched by executing an `AppRun` script or a same-named binary — let you install software by dropping a folder anywhere on the filesystem, no package manager required. The `actions.toml` file lets you bind any file extension, MIME glob, or exact filename to an arbitrary shell command, bypassing `xdg-open` entirely when you want finer control. Together these features restore the Unix philosophy of small, composable tools that the modern desktop has largely abandoned.
+The ROX-Filer lineage shows up most clearly in AppDir support and in the `actions.toml` MIME-hook system. AppDirs — directories that bundle an application together with its icons and resources, launched by executing an `AppRun` script or a same-named binary — let you install software by dropping a folder anywhere on the filesystem, no package manager required. The `actions.toml` file lets you bind any file extension, MIME glob, or exact filename to an arbitrary shell command. There is no `xdg-open` and no system MIME database to defer to — your rules and runar's built-in table are the whole story. Together these features restore the Unix philosophy of small, composable tools that the modern desktop has largely abandoned.
 
 ---
 
@@ -38,7 +38,7 @@ runar is built around a small, deliberate feature set that prioritizes speed, pr
 - **Keyboard-first navigation** — Vim-style `H`/`J`/`K`/`L` plus arrow keys, with `/` or Ctrl+L to toggle the pathbar into edit mode and Enter to activate the selection.
 - **Dual-pane visual language** — breadcrumb pathbar on top, three-section sidebar (DEVICES, LOCATIONS, BOOKMARKS) on the left, and a scrolling file list on the right.
 - **ROX-Filer AppDir support** — directories containing an `AppRun` script or a same-named executable are detected and can be launched as applications; Shift+Enter overrides this to enter them as directories.
-- **`actions.toml` MIME hooks** — bind any file extension, MIME glob (e.g. `image/*`), or exact filename to an arbitrary shell command, taking precedence over `xdg-open`.
+- **`actions.toml` MIME hooks** — bind any file extension, MIME glob (e.g. `image/*`), or exact filename to an arbitrary shell command, taking precedence over the built-in MIME table.
 - **Pure-Rust mount polling** — replaces `gio::VolumeMonitor` with a direct `/proc/mounts` reader that filters out pseudo-filesystems and unescapes octal sequences in mount points.
 - **Daemon-free sidebar** — no settings daemon, no volume monitor service, no icon theme; the sidebar reflects actual filesystem mounts and user-defined locations only.
 - **User-editable bookmarks** — `bookmarks.toml` is purely user-added, with no injected XDG defaults; the Bookmarks section starts empty.
@@ -107,11 +107,16 @@ runar is driven from the keyboard. Every navigation action has both an arrow-key
 |-----|--------|
 | Arrow Up / `K` | move selection up |
 | Arrow Down / `J` | move selection down |
-| `H` / Backspace | go up one directory |
+| `H` / Backspace / Alt+Up | go up one directory |
 | `L` / Enter | activate selection (open / launch / navigate) |
 | Shift+Enter | on an AppDir, enter it as a directory (overrides launch) |
 | `/` or Ctrl+L | toggle pathbar edit mode |
+| Ctrl+H | toggle hidden files |
+| Ctrl+R | reload current directory |
+| Ctrl+D | bookmark current directory |
 | Escape | exit pathbar edit mode |
+
+When hidden files are hidden, arrow/vim navigation moves over the *visible* rows only, so the selection highlight never lands on a row you can't see. The pathbar accepts a leading `~/` (expanded to `$HOME`) and tolerates stray whitespace around the path.
 
 The global keyboard handler lives in `src/main.rs` and dispatches into `App::update()` for state mutation. When the pathbar is in edit mode, the file grid ignores navigation keys so that typing a path does not move the selection. Shift+Enter on a directory that runar has detected as an AppDir will descend into it as a normal directory rather than executing its `AppRun` script, which is the escape hatch you need when you want to inspect an AppDir's contents rather than launch the application it bundles.
 
@@ -156,14 +161,14 @@ command = "make -C $(dirname {})"
 ```toml
 [[actions]]
 pattern = "txt"
-commands = ["scitano {}", "scite {}", "geany {}", "nano {}"]
+commands = ["scitano {}", "scite {}", "geany {}", "kate {}"]
 
 [[actions]]
 pattern = "image/*"
-commands = ["feh {}", "sxiv {}", "xdg-open {}"]
+commands = ["feh {}", "nsxiv {}", "gpicview {}"]
 ```
 
-If every command in the chain fails the `$PATH` check, runar falls through to the built-in MIME table, then to `xdg-open`. The chain is checked statically (we parse the leading binary name from each command string and verify it exists on `$PATH` before spawning) so a missing binary doesn't pay the cost of a failed `sh -c` invocation.
+If every command in the chain fails the `$PATH` check, runar falls through to the built-in MIME table, and finally runs the file directly if it carries an executable bit (the ROX-Filer convention). There is no `xdg-open` anywhere in the pipeline — runar defers to no system database. The chain is checked statically (we parse the leading binary name from each command string and verify it exists on `$PATH` before spawning) so a missing binary doesn't pay the cost of a failed `sh -c` invocation.
 
 Both files are written atomically on save: runar writes to a sibling temp file and then renames it over the original, so a crash or power loss mid-write cannot leave a half-written config behind. The config engine has unit tests covering roundtrip serialization, the fail-soft behavior when a config file does not exist yet, and the precedence rules for `actions.toml` patterns.
 
@@ -204,13 +209,13 @@ src/
   mounts.rs            /proc/mounts poller + pure parse_mounts() (replaces gio::VolumeMonitor)
   icons.rs             Inline SVG glyph set with cached LazyLock<Handle> per variant
   mime.rs              Built-in default MIME action table (text→$EDITOR, image→$IMAGE_VIEWER, etc.)
-  launch.rs            Launch dispatcher: AppDir exec → actions.toml → built-in MIME → xdg-open
+  launch.rs            Launch dispatcher: AppDir exec → actions.toml → built-in MIME → executable-bit exec
   ui/
     mod.rs             App state, update(), view(), subscription(), handle_key()
     pathbar.rs         Breadcrumb view, toggleable to text input via / or Ctrl+L
     sidebar.rs         Three sections: DEVICES, LOCATIONS, BOOKMARKS
     grid.rs            Scrolling file list with icon/name/size/modified/type columns (mouse_area for right-click)
-    menubar.rs         Top menubar (File/Edit/View/Go/Bookmarks/Help) + dropdown panels
+    menubar.rs         Top menubar (File/Edit/View/Go/Bookmarks/Help) + horizontal menu strips
     context_menu.rs    Right-click context menu with type-aware entries per file kind
     about.rs           About dialog (Help → About runar)
 ```
@@ -230,7 +235,7 @@ cargo test --bin runar
 The test suite covers every non-UI module and is structured to mirror the source tree, so each module's tests live alongside its implementation in a `#[cfg(test)] mod tests` block. Tests are deterministic, do not mutate process-global state (no `std::env::set_var` calls — overrides are threaded through function parameters instead, which avoids both parallel-test flakiness and the `unsafe` requirement that Rust 1.82+ imposes on env mutation), and do not touch the real filesystem for writes: where a temp directory is needed, the tests use `std::env::temp_dir()` and clean up after themselves. The full breakdown:
 
 - **date::tests::\*** — Howard Hinnant `civil_from_days` algorithm: epoch anchors, leap-year handling (1972 leap, 1973 non-leap, 2000 leap despite div-by-100, 1900 and 2100 non-leap), pre-epoch dates, Y2K rollover, `format_date` shape (14 tests)
-- **mime::tests::\*** — built-in default MIME action table: text→editor chain (scitano→scite→geany→nano, $EDITOR first), image→$IMAGE_VIEWER, video/audio/PDF→xdg-open-with-env-override, HTML→$BROWSER (checked before text/ rule), archives→`ls -l`, JSON/YAML/TOML/XML→editor, shellscript→editor, editor chain ordering, $EDITOR precedence, unknown MIME returns None, charset-suffix stripping, path-based resolution (17 tests)
+- **mime::tests::\*** — built-in default MIME action table: text→editor chain (scitano→scite→geany→kate→mousepad, $EDITOR first), image→$IMAGE_VIEWER chain, video/audio/PDF/browser→env-var + lightweight-binary chains, no-xdg guard (checked before text/ rule), archives→`ls -l`, JSON/YAML/TOML/XML→editor, shellscript→editor, editor chain ordering, $EDITOR precedence, unknown MIME returns None, charset-suffix stripping, path-based resolution (17 tests)
 - **config::tests::\*** — config load/save roundtrip, missing-config fail-soft, `config_dir_with` path composition (3 tests)
 - **config::bookmarks::tests::\*** — `bookmarks.toml` roundtrip (1 test)
 - **config::actions::tests::\*** — pattern matching (extension, dot-prefix, MIME glob, exact filename), single-command form, fallback-chain form, `commands_to_try` ordering (chain wins over single), empty action, TOML roundtrip for both forms, TOML parsing of both forms (12 tests)
@@ -251,7 +256,7 @@ runar is feature-complete for daily power-user use, but several capabilities tha
 
 - [x] Phase 1: Core engine & async VFS (scanner, watcher, AppDir detector)
 - [x] Phase 2: Shell layout (pathbar, sidebar, file grid, keyboard nav)
-- [x] Phase 3: Launch dispatcher (AppDir exec, actions.toml, built-in MIME table, xdg-open fallback)
+- [x] Phase 3: Launch dispatcher (AppDir exec, actions.toml, built-in MIME table, executable-bit fallback — no xdg)
 - [x] Phase 4: Config engine (bookmarks.toml, actions.toml, atomic save)
 - [ ] Background copy/move/delete with progress toasts
 - [ ] True multi-column icon grid with spatial H/J/K/L navigation
